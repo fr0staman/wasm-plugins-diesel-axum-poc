@@ -1,0 +1,33 @@
+[package]
+name = "host"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "host"
+path = "src/main.rs"
+
+[dependencies]
+wasmtime         = { workspace = true }
+wasmtime-wasi    = { workspace = true }
+diesel           = { workspace = true, features = ["chrono"] }
+diesel-async     = { workspace = true, features = ["async-connection-wrapper"] }
+diesel_migrations = "2"
+chrono           = "0.4"
+sqlparser        = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum             = { workspace = true }
+utoipa           = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+anyhow           = { workspace = true }
+dashmap          = { workspace = true }
+config           = { workspace = true }
+matchit  = "0.8"
+dotenvy  = "0.15.7"
+futures-util = { workspace = true }
+async-stream  = "0.3"
+jsonwebtoken  = "9"
+utoipa-axum = "0.2.0"

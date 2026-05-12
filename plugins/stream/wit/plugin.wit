@@ -1,0 +1,189 @@
+package myapp:plugin@0.1.0;
+
+interface types {
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    record http-request {
+        method: string,
+        uri: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+    }
+
+    record user-snapshot {
+        id: u64,
+        tenant-id: u64,
+        email: string,
+        locale: string,
+        tier: user-tier,
+    }
+    enum user-tier { free, pro, enterprise }
+
+    record payment-snapshot {
+        id: u64,
+        amount-cents: s64,
+        currency: string,
+        method: string,
+        created-at: u64,
+    }
+
+    record payment-made-event {
+        user: user-snapshot,
+        payment: payment-snapshot,
+    }
+    record reward-granted-event {
+        user: user-snapshot,
+        reward-cents: s64,
+        triggered-by-payment: u64,
+    }
+
+    /// Strongly-typed payloads for built-in system events.
+    variant system-event {
+        payment-made(payment-made-event),
+        reward-granted(reward-granted-event),
+    }
+
+    /// Discriminant for system events, used in subscription declarations.
+    enum system-event-kind { payment-made, reward-granted }
+
+    /// Plugin-introduced custom event — %name identifies the type, payload is opaque bytes.
+    record custom-event {
+        name: string,
+        payload: list<u8>,
+    }
+
+    /// All events on the bus: built-in system events or plugin-introduced custom events.
+    variant event-payload {
+        system(system-event),
+        custom(custom-event),
+    }
+
+    /// What a plugin subscribes to: a known system event (enum-keyed) or a custom event (string-keyed).
+    variant event-subscription {
+        system(system-event-kind),
+        custom(string),
+    }
+
+    record event-envelope {
+        id: u64,
+        emitted-at: u64,
+        chain-depth: u8,
+        source: event-source,
+        payload: event-payload,
+    }
+    variant event-source { host, plugin(string) }
+
+    record rendered-query {
+        sql: string,
+        binds: list<list<u8>>,
+        bind-types: list<u32>,
+    }
+
+    record migration {
+        version: string,
+        up-sql: string,
+        down-sql: string,
+    }
+
+    variant plugin-error {
+        db-error(string),
+        invalid-input(string),
+        not-found,
+        internal(string),
+    }
+
+    enum log-level { error, warn, info, debug }
+
+    /// Typed WebSocket frame. %close carries an optional close reason.
+    variant ws-message {
+        text(string),
+        binary(list<u8>),
+        close(option<string>),
+    }
+
+    /// All static plugin metadata returned in a single host call, avoiding repeated instantiations at load time.
+    record plugin-manifest {
+        name: string,
+        version: string,
+        subscribed-events: list<event-subscription>,
+        migrations: list<migration>,
+        openapi: string,
+    }
+}
+
+interface host-api {
+    use types.{rendered-query, plugin-error, event-payload, log-level,
+               user-snapshot, user-tier, payment-snapshot, ws-message};
+
+    db-query: func(q: rendered-query)
+        -> result<list<list<list<u8>>>, plugin-error>;
+    db-execute: func(q: rendered-query) -> result<u64, plugin-error>;
+
+    emit-event: func(payload: event-payload) -> result<_, plugin-error>;
+
+    cache-get: func(key: string) -> option<list<u8>>;
+    cache-set: func(key: string, value: list<u8>, ttl-secs: u32);
+
+    log: func(level: log-level, msg: string);
+
+    /// Look up a single user by primary key.
+    get-user: func(user-id: u64) -> result<user-snapshot, plugin-error>;
+    /// List all users belonging to a tenant.
+    list-users: func(tenant-id: u64) -> result<list<user-snapshot>, plugin-error>;
+    /// Create a new user; returns the persisted snapshot.
+    create-user: func(tenant-id: u64, email: string, locale: string, tier: user-tier)
+        -> result<user-snapshot, plugin-error>;
+
+    /// Look up a single payment by primary key.
+    get-payment: func(payment-id: u64) -> result<payment-snapshot, plugin-error>;
+    /// List all payments for a user.
+    list-user-payments: func(user-id: u64) -> result<list<payment-snapshot>, plugin-error>;
+    /// Record a new payment; returns the persisted snapshot.
+    create-payment: func(user-id: u64, amount-cents: s64, currency: string, method: string)
+        -> result<payment-snapshot, plugin-error>;
+
+    /// Receive the next typed WebSocket message.
+    /// Returns none when the client closed the connection.
+    ws-recv: func() -> option<ws-message>;
+
+    /// Send a typed WebSocket message to the connected client.
+    ws-send: func(msg: ws-message) -> result<_, plugin-error>;
+
+    /// Push one SSE data chunk to the connected client.
+    /// Each call emits a single data: line; the stream closes when handle-sse returns.
+    sse-yield: func(data: list<u8>) -> result<_, plugin-error>;
+}
+
+interface plugin-api {
+    use types.{event-envelope, plugin-error, http-request, http-response, plugin-manifest};
+
+    /// Return all static metadata in one call. HTTP routes are derived by the host from
+    /// the openapi field; no separate http-routes list is needed.
+    manifest: func() -> plugin-manifest;
+
+    init: func() -> result<_, plugin-error>;
+    handle-event: func(evt: event-envelope) -> result<_, plugin-error>;
+    handle-http: func(req: http-request) -> result<http-response, plugin-error>;
+
+    /// Called once per WebSocket connection. Runs for the lifetime of the connection:
+    /// loop on ws-recv until none, call ws-send to reply. The CM async machinery
+    /// properly suspends the plugin fiber while awaiting each ws-recv.
+    handle-websocket: func(path: string, conn-id: u64) -> result<_, plugin-error>;
+
+    /// Called once per SSE connection. Push chunks by calling sse-yield; returning Ok(()) closes the stream.
+    handle-sse: func(path: string, conn-id: u64) -> result<_, plugin-error>;
+}
+
+world plugin {
+    import host-api;
+    export plugin-api;
+}
