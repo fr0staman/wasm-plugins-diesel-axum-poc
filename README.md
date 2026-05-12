@@ -1,14 +1,12 @@
-# wasm-plugins-diesel-axum-poc
+# wasm-plugins-diesel-poc
 
 A proof-of-concept for a runtime plugin system built on the **WebAssembly Component Model**.
 Plugins are compiled to `.wasm` once and loaded by an Axum host at startup. Each plugin:
 
 - declares its HTTP / WebSocket / SSE routes and event subscriptions via an OpenAPI spec
-- typed event system between host <-> plugin <-> plugin, own extendable event system for plugins
 - runs in a sandboxed Wasmtime store with fuel limits and table-access validation
 - can read and write its own Postgres tables via Diesel queries that cross the WASM boundary
 - optionally requires JWT authentication on individual routes, declared in OpenAPI
-- possible async work (need to wait wasm32-wasip3)
 
 ---
 
@@ -80,6 +78,128 @@ GET  /payments/{id}                                  DELETE /payments/{id}
 Unregistered routes return `404` before touching WASM. Routes annotated with
 `bearerAuth` in the plugin's OpenAPI spec return `401` before the WASM boundary
 is crossed.
+
+---
+
+## Event system
+
+The host maintains a **broadcast channel** (`tokio::sync::broadcast`, capacity 256) that carries
+`EventEnvelope` values between producers and consumers.
+
+### Sources
+
+| Source | How |
+|--------|-----|
+| REST | `POST /events` with a typed JSON body (see below) |
+| Plugin | Call `emit-event(payload)` from inside `handle_event` or `handle_http` |
+
+### Envelope fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `u64` | Random identifier for the event instance |
+| `emitted_at` | `u64` | Unix timestamp (seconds) at emission time |
+| `chain_depth` | `u8` | 0 for host-originated events; incremented by 1 each time a plugin re-emits |
+| `source` | `host \| plugin(name)` | Who produced the envelope |
+| `payload` | `system(…) \| custom(…)` | The event data |
+
+### Delivery rules
+
+- **Emitter filter** — a plugin never receives an event it emitted itself.
+- **Chain-depth cap** — `chain_depth ≥ 8` drops the event with a `WARN` log, preventing infinite
+  plugin-to-plugin loops.
+- **Lagged receivers** — if the broadcast channel fills up, the event loop logs the number of
+  dropped envelopes and continues.
+- **Concurrency** — handlers for different plugins run sequentially in the event loop task
+  (one WASM instantiation per plugin per event).
+
+### System event types
+
+#### `payment_made`
+
+```json
+{
+  "type": "payment_made",
+  "user": {
+    "id": 1, "tenant_id": 1, "email": "alice@example.com",
+    "locale": "en", "tier": "pro"
+  },
+  "payment": {
+    "id": 42, "amount_cents": 5000, "currency": "USD",
+    "method": "card", "created_at": 1700000000
+  }
+}
+```
+
+#### `reward_granted`
+
+```json
+{
+  "type": "reward_granted",
+  "user": { "id": 1, "tenant_id": 1, "email": "alice@example.com", "locale": "en", "tier": "pro" },
+  "reward_cents": 250,
+  "triggered_by_payment": 42
+}
+```
+
+After delivery to plugins, the host also broadcasts this event as JSON over the `/ws/push`
+WebSocket channel so connected clients receive it in real time.
+
+#### `custom`
+
+```json
+{ "type": "custom", "name": "order_shipped", "payload": { "order_id": 7 } }
+```
+
+The `payload` field is optional; if present it is JSON-serialized to bytes and forwarded
+to subscribing plugins as-is.
+
+### Subscribing to events (plugin side)
+
+```rust
+// events.rs
+pub fn subscribed_events() -> Vec<EventSubscription> {
+    vec![
+        EventSubscription::System(SystemEventKind::PaymentMade),
+        EventSubscription::Custom("order_shipped".into()),
+    ]
+}
+```
+
+Subscriptions are declared in `manifest()` and read once at load time.
+
+### Emitting events (plugin side)
+
+```rust
+// inside handle_event or handle_http
+host_api::emit_event(EventPayload::Custom(CustomEvent {
+    name: "order_shipped".into(),
+    payload: serde_json::to_vec(&json!({"order_id": 7})).unwrap(),
+}))
+.await
+.ok();
+```
+
+### Example REST calls
+
+```bash
+# Emit a payment_made event
+curl -s -X POST http://localhost:3000/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "type": "payment_made",
+    "user": {"id":1,"tenant_id":1,"email":"alice@example.com","locale":"en","tier":"pro"},
+    "payment": {"id":1,"amount_cents":5000,"currency":"USD","method":"card","created_at":1700000000}
+  }'
+
+# Emit a custom event
+curl -s -X POST http://localhost:3000/events \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"custom","name":"order_shipped","payload":{"order_id":7}}'
+
+# Watch real-time reward_granted push events over WebSocket
+wscat -c ws://localhost:3000/ws/push
+```
 
 ---
 
