@@ -10,8 +10,6 @@ path = "src/main.rs"
 [dependencies]
 wasmtime         = { workspace = true }
 wasmtime-wasi    = { workspace = true }
-wasmtime-wasi-http = { version = "47.0.2", default-features = false, features = ["p3"] }
-http-body-util   = "0.1"
 diesel           = { workspace = true, features = ["chrono"] }
 diesel-async     = { workspace = true, features = ["async-connection-wrapper"] }
 diesel_migrations = "2"

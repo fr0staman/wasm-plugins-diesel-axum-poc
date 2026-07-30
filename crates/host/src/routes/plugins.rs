@@ -513,34 +513,3 @@ async fn handle_ws_plugin(
     outbound_task.abort();
 }
 
-/// SPIKE: passthrough to a plugin's `wasi:http/handler` export.
-///
-/// The entire body of this function is route lookup plus one call — all the
-/// header/body/stream conversion that `plugin_handler` does by hand lives in
-/// wasmtime-wasi-http instead.
-pub async fn wasi_http_handler(
-    State(app): State<AppState>,
-    Path((plugin_name, path)): Path<(String, String)>,
-    req: axum::extract::Request,
-) -> Response {
-    let Some((executor, plugin_pre)) = app.runtime.prepare_wasi_http(&plugin_name) else {
-        return (StatusCode::NOT_FOUND, "no such plugin").into_response();
-    };
-
-    // Rewrite the URI to be plugin-relative: the plugin routes on what it sees,
-    // and it should not see the host's /h/{plugin} prefix.
-    let mut req = req;
-    let plugin_uri = match req.uri().query() {
-        Some(q) => format!("/{path}?{q}"),
-        None => format!("/{path}"),
-    };
-    *req.uri_mut() = plugin_uri.parse().unwrap_or_else(|_| "/".parse().unwrap());
-
-    match crate::runtime::call_wasi_http(&executor, &plugin_name, &plugin_pre, req).await {
-        Ok(resp) => resp.into_response(),
-        Err(e) => {
-            tracing::error!(plugin = %plugin_name, error = %e, "wasi:http plugin call failed");
-            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
-        }
-    }
-}

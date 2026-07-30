@@ -224,11 +224,3 @@ world plugin-guest {
 
 }
 
-/// SPIKE: `plugin-guest` plus the standard wasi:http entry point. A plugin in
-/// this world is also a plain wasi:http service, so the host can call it through
-/// wasmtime-wasi-http's `Service` bindings instead of hand-converting requests
-/// and bodies. Only `plugins/stream` uses this while the approach is evaluated.
-world plugin-http-guest {
-    include plugin-guest;
-    export wasi:http/handler@0.3.0;
-}

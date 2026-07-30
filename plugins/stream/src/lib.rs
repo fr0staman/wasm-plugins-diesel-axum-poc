@@ -2,7 +2,7 @@ mod bindings {
     wit_bindgen::generate!({
         // Directory, not the bare file, so `wit/deps` resolves.
         path: "./wit",
-        world: "plugin-http-guest",
+        world: "plugin-guest",
         generate_all,
     });
 
@@ -11,7 +11,6 @@ mod bindings {
 }
 
 mod events;
-mod http_service;
 mod migrations;
 mod router;
 
