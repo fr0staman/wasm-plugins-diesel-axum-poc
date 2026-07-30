@@ -51,7 +51,6 @@ impl Guest for Component {
     /// closes. Dropping `replies` ends the stream, after which `done` resolves.
     async fn handle_websocket(
         path: String,
-        conn_id: u64,
         incoming: wit_bindgen::StreamReader<WsMessage>,
     ) -> (
         wit_bindgen::StreamReader<WsMessage>,
@@ -59,7 +58,7 @@ impl Guest for Component {
     ) {
         host_api::log(
             LogLevel::Info,
-            &format!("ws connected: path={path} conn={conn_id}"),
+            &format!("ws connected: path={path}"),
         );
 
         let (mut replies_tx, replies_rx) = wit_stream::new::<WsMessage>();
@@ -105,7 +104,7 @@ impl Guest for Component {
 
             host_api::log(
                 LogLevel::Info,
-                &format!("ws disconnected: conn={conn_id}"),
+                &format!("ws disconnected: path={path}"),
             );
             drop(replies_tx);
             done_tx.write(Ok(())).await;
@@ -116,7 +115,6 @@ impl Guest for Component {
 
     async fn handle_sse(
         _path: String,
-        _conn_id: u64,
     ) -> (
         wit_bindgen::StreamReader<Vec<u8>>,
         wit_bindgen::FutureReader<Result<(), PluginError>>,

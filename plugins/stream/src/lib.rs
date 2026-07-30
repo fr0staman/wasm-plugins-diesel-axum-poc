@@ -91,7 +91,6 @@ impl Guest for Component {
 
     async fn handle_websocket(
         _path: String,
-        _conn_id: u64,
         _incoming: wit_bindgen::StreamReader<WsMessage>,
     ) -> (
         wit_bindgen::StreamReader<WsMessage>,
@@ -111,7 +110,6 @@ impl Guest for Component {
     /// client throttles this loop instead of piling up in the host.
     async fn handle_sse(
         path: String,
-        _conn_id: u64,
     ) -> (
         wit_bindgen::StreamReader<Vec<u8>>,
         wit_bindgen::FutureReader<Result<(), PluginError>>,

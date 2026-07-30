@@ -344,9 +344,8 @@ async fn ws_plugin_handler(
         }
     }
 
-    let conn_id = crate::host_api::new_conn_id();
     ws.on_upgrade(move |socket| {
-        handle_ws_plugin(socket, plugin_name, ws_path, conn_id, pre, executor)
+        handle_ws_plugin(socket, plugin_name, ws_path, pre, executor)
     })
 }
 
@@ -420,7 +419,6 @@ async fn sse_plugin_handler(
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let full_path = format!("{sse_path}{query}");
 
-    let conn_id = crate::host_api::new_conn_id();
     // Bounded: the plugin's stream writes block once the client falls this far
     // behind, rather than the host buffering without limit. Items arrive in
     // batches, so capacity is STREAM_BUFFER batches, not chunks.
@@ -428,7 +426,7 @@ async fn sse_plugin_handler(
 
     tokio::spawn(async move {
         if let Err(e) = executor
-            .call_sse(&plugin_name, &pre, full_path, conn_id, outbound_tx)
+            .call_sse(&plugin_name, &pre, full_path, outbound_tx)
             .await
         {
             tracing::error!(plugin = %plugin_name, error = %e, "sse plugin error");
@@ -454,7 +452,6 @@ async fn handle_ws_plugin(
     socket: axum::extract::ws::WebSocket,
     plugin_name: String,
     path: String,
-    conn_id: u64,
     pre: crate::bindings::PluginPre<crate::host_api::PluginState>,
     executor: std::sync::Arc<crate::runtime::PluginExecutor>,
 ) {
@@ -503,7 +500,7 @@ async fn handle_ws_plugin(
     });
 
     if let Err(e) = executor
-        .call_websocket(&plugin_name, &pre, path, conn_id, inbound_rx, outbound_tx)
+        .call_websocket(&plugin_name, &pre, path, inbound_rx, outbound_tx)
         .await
     {
         tracing::error!(plugin = %plugin_name, error = %e, "ws plugin error");

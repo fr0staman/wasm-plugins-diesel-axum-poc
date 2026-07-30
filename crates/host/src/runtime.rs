@@ -173,7 +173,6 @@ impl PluginExecutor {
         plugin_name: &str,
         pre: &PluginPre<PluginState>,
         path: String,
-        conn_id: u64,
         inbound: mpsc::Receiver<WsMessage>,
         outbound: mpsc::Sender<Vec<WsMessage>>,
     ) -> anyhow::Result<()> {
@@ -188,7 +187,7 @@ impl PluginExecutor {
 
                 let (replies, done) = instance
                     .myapp_plugin_plugin_api()
-                    .call_handle_websocket(accessor, path, conn_id, incoming)
+                    .call_handle_websocket(accessor, path, incoming)
                     .await?;
 
                 accessor.with(|mut store: Access<'_, PluginState>| {
@@ -207,7 +206,6 @@ impl PluginExecutor {
         plugin_name: &str,
         pre: &PluginPre<PluginState>,
         path: String,
-        conn_id: u64,
         outbound: mpsc::Sender<Vec<Vec<u8>>>,
     ) -> anyhow::Result<()> {
         let mut store = self.make_store_streaming(plugin_name, u64::MAX);
@@ -217,7 +215,7 @@ impl PluginExecutor {
             .run_concurrent(async move |accessor: &Accessor<PluginState>| -> anyhow::Result<()> {
                 let (chunks, done) = instance
                     .myapp_plugin_plugin_api()
-                    .call_handle_sse(accessor, path, conn_id)
+                    .call_handle_sse(accessor, path)
                     .await?;
 
                 accessor.with(|mut store: Access<'_, PluginState>| {

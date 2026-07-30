@@ -24,10 +24,6 @@ pub struct PluginState {
     pub current_chain_depth: u8,
 }
 
-pub fn new_conn_id() -> u64 {
-    crate::util::rand_id()
-}
-
 // Empty marker trait required by Plugin::add_to_linker
 impl TypesHost for PluginState {}
 

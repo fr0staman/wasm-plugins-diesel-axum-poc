@@ -193,13 +193,13 @@ interface plugin-api {
     /// The returned future reports how the connection ended: dropping the reply
     /// stream closes it, and the future then resolves. Stream carries data,
     /// future carries the terminal result.
-    handle-websocket: async func(path: string, conn-id: u64, incoming: stream<ws-message>)
+    handle-websocket: async func(path: string, incoming: stream<ws-message>)
         -> tuple<stream<ws-message>, future<result<_, plugin-error>>>;
 
     /// Called once per SSE connection. Each item on the returned stream becomes
     /// one `data:` line; dropping the stream closes it. `async func` for the
     /// same reason as handle-websocket above.
-    handle-sse: async func(path: string, conn-id: u64)
+    handle-sse: async func(path: string)
         -> tuple<stream<list<u8>>, future<result<_, plugin-error>>>;
 }
 
