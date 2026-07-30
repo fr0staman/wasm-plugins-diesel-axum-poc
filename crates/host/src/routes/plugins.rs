@@ -13,8 +13,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::runtime::event_subscription_name;
 use crate::{
     auth,
-    bindings::myapp::plugin::types::{HttpHeader, HttpRequest, WsMessage},
+    bindings::myapp::plugin::types::{HttpHeader, WsMessage},
 };
+
+use std::convert::Infallible;
+use tokio::sync::mpsc;
 
 use crate::api::AppState;
 
@@ -101,10 +104,17 @@ pub async fn plugin_handler(
     State(app): State<AppState>,
     Path((plugin_name, path)): Path<(String, String)>,
     method: Method,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Route matching uses the bare path; the plugin gets the query string too,
+    // otherwise a handler using axum's `Query` extractor would never see it.
     let plugin_path = format!("/{path}");
+    let plugin_uri = match uri.query() {
+        Some(q) => format!("{plugin_path}?{q}"),
+        None => plugin_path.clone(),
+    };
     let method_upper = method.as_str().to_ascii_uppercase();
 
     // Single Vec scan: resolve route + auth flag before allocating any headers.
@@ -165,31 +175,66 @@ pub async fn plugin_handler(
         });
     }
 
-    let req = HttpRequest {
-        method: method.to_string(),
-        uri: plugin_path,
-        headers: forwarded,
-        body: if body.is_empty() {
-            None
-        } else {
-            Some(body.to_vec())
-        },
+    // Request body in, response body out — both streamed. The wasm task runs on
+    // its own tokio task so axum can begin sending the response while the plugin
+    // is still writing it.
+    let (req_tx, req_rx) = mpsc::channel::<Vec<u8>>(STREAM_BUFFER);
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel::<(u16, Vec<HttpHeader>)>();
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Vec<u8>>(STREAM_BUFFER);
+
+    let method_s = method.to_string();
+    let plugin_for_task = plugin_name.clone();
+    let call = tokio::spawn(async move {
+        executor
+            .call_http(
+                &plugin_for_task,
+                &plugin_pre,
+                method_s,
+                plugin_uri,
+                forwarded,
+                req_rx,
+                head_tx,
+                resp_tx,
+            )
+            .await
+    });
+
+    // Feed the (already collected) request body in. Kept as one send because the
+    // axum extractor hands us the whole buffer; the win is that the guest only
+    // pulls what it reads.
+    if !body.is_empty() {
+        let _ = req_tx.send(body.to_vec()).await;
+    }
+    drop(req_tx);
+
+    let Ok((status, headers)) = head_rx.await else {
+        // No head means the plugin failed before returning a response.
+        let msg = match call.await {
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(())) => "plugin returned no response".to_string(),
+            Err(e) => e.to_string(),
+        };
+        return (StatusCode::BAD_GATEWAY, msg).into_response();
     };
 
-    match executor.call_http(&plugin_name, &plugin_pre, req).await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let mut builder = Response::builder().status(status);
-            for h in &resp.headers {
-                builder = builder.header(&h.name, &h.value);
-            }
-            builder
-                .body(axum::body::Body::from(resp.body.unwrap_or_default()))
-                .unwrap()
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+    for h in &headers {
+        builder = builder.header(&h.name, &h.value);
     }
+
+    let body_stream = async_stream::stream! {
+        while let Some(chunk) = resp_rx.recv().await {
+            yield Ok::<_, Infallible>(axum::body::Bytes::from(chunk));
+        }
+        if let Ok(Err(e)) = call.await {
+            tracing::error!(plugin = %plugin_name, error = %e, "http plugin error");
+        }
+    };
+
+    builder
+        .body(axum::body::Body::from_stream(body_stream))
+        .unwrap()
 }
 
 /// WebSocket passthrough — upgrades the connection and delegates it to the named plugin.
@@ -473,4 +518,33 @@ async fn handle_ws_plugin(
 
     inbound_task.abort();
     outbound_task.abort();
+}
+
+/// SPIKE: passthrough to a plugin's `wasi:http/handler` export.
+///
+/// The entire body of this function is route lookup plus one call — all the
+/// header/body/stream conversion that `plugin_handler` does by hand lives in
+/// wasmtime-wasi-http instead.
+pub async fn wasi_http_handler(
+    State(app): State<AppState>,
+    Path((plugin_name, path)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    let Some((executor, plugin_pre)) = app.runtime.prepare_wasi_http(&plugin_name) else {
+        return (StatusCode::NOT_FOUND, "no such plugin").into_response();
+    };
+
+    // Rewrite the URI to be plugin-relative: the plugin routes on what it sees,
+    // and it should not see the host's /h/{plugin} prefix.
+    let mut req = req;
+    let plugin_uri = match req.uri().query() {
+        Some(q) => format!("/{path}?{q}"),
+        None => format!("/{path}"),
+    };
+    *req.uri_mut() = plugin_uri.parse().unwrap_or_else(|_| "/".parse().unwrap());
+
+    match crate::runtime::call_wasi_http(&executor, &plugin_name, &plugin_pre, req).await {
+        Ok(resp) => resp.into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
 }

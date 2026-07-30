@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 
 use crate::bindings::myapp::plugin::types::{HttpHeader, HttpRequest, HttpResponse, PluginError};
+use crate::bindings::wit_stream;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -55,13 +56,52 @@ pub async fn dispatch(req: HttpRequest) -> Result<HttpResponse, PluginError> {
         builder = builder.header(&h.name, &h.value);
     }
 
-    let request = builder
-        .body(Body::from(req.body.unwrap_or_default()))
-        .unwrap();
+    // These handlers take small JSON bodies, so collecting is fine here. The
+    // saving is on the host side: nothing is lowered into guest memory until
+    // this read happens, and a route that ignores the body reads nothing.
+    let hint = content_length(&req.headers);
+    let body = read_body(req.body, hint).await;
+    let request = builder.body(Body::from(body)).unwrap();
 
     let response = ROUTER.0.clone().oneshot(request).await.unwrap();
 
     response_to_wit(response).await
+}
+
+/// Drains a `stream<u8>` request body into memory.
+/// Drains a `stream<u8>` request body into memory.
+///
+/// `read` fills the spare capacity of the buffer it is given and hands it back,
+/// so the buffer passed in *is* the output buffer — reading into a scratch buffer
+/// and appending would copy every byte twice. `hint` (from content-length) sizes
+/// the allocation up front, which both avoids reallocation and lets a whole body
+/// arrive in a single crossing.
+async fn read_body(mut body: wit_bindgen::StreamReader<u8>, hint: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hint.max(READ_CHUNK));
+    loop {
+        // `read` is a no-op without spare capacity.
+        if out.len() == out.capacity() {
+            out.reserve(READ_CHUNK);
+        }
+        let (result, returned) = body.read(out).await;
+        out = returned;
+        if matches!(result, wit_bindgen::StreamResult::Dropped) {
+            break;
+        }
+    }
+    out
+}
+
+/// Spare capacity requested per read when content-length is absent or exhausted.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Parses content-length so the body buffer can be sized in one allocation.
+fn content_length(headers: &[HttpHeader]) -> usize {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| h.value.parse().ok())
+        .unwrap_or(0)
 }
 
 async fn response_to_wit(resp: Response<Body>) -> Result<HttpResponse, PluginError> {
@@ -69,6 +109,16 @@ async fn response_to_wit(resp: Response<Body>) -> Result<HttpResponse, PluginErr
     let body = to_bytes(body, usize::MAX)
         .await
         .map_err(|e| PluginError::Internal(e.to_string()))?;
+
+    // Hand back status+headers immediately and write the body on the stream;
+    // the host starts responding without waiting for it to finish.
+    let (mut body_tx, body_rx) = wit_stream::new::<u8>();
+    wit_bindgen::spawn_local(async move {
+        if !body.is_empty() {
+            body_tx.write_all(body.to_vec()).await;
+        }
+        drop(body_tx);
+    });
 
     Ok(HttpResponse {
         status: parts.status.as_u16(),
@@ -80,7 +130,7 @@ async fn response_to_wit(resp: Response<Body>) -> Result<HttpResponse, PluginErr
                 value: v.to_str().unwrap_or("").to_string(),
             })
             .collect(),
-        body: Some(body.to_vec()),
+        body: body_rx,
     })
 }
 

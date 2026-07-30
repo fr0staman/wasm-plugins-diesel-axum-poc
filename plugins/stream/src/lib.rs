@@ -2,7 +2,7 @@ mod bindings {
     wit_bindgen::generate!({
         // Directory, not the bare file, so `wit/deps` resolves.
         path: "./wit",
-        world: "plugin-guest",
+        world: "plugin-http-guest",
         generate_all,
     });
 
@@ -11,6 +11,7 @@ mod bindings {
 }
 
 mod events;
+mod http_service;
 mod migrations;
 mod router;
 
@@ -23,6 +24,9 @@ use bindings::myapp::plugin::types::{
 
 /// Items per boundary crossing on the SSE stream.
 const SSE_BATCH: usize = 32;
+
+/// Bytes per crossing on an HTTP body stream.
+const BODY_CHUNK: usize = 64 * 1024;
 
 struct Component;
 
@@ -45,8 +49,45 @@ impl Guest for Component {
         events::dispatch(evt).await
     }
 
-    async fn handle_http(_req: HttpRequest) -> Result<HttpResponse, PluginError> {
-        Err(PluginError::NotFound)
+    /// `GET /download?bytes=N` — generates N bytes onto the response stream
+    /// without ever holding the whole body, demonstrating that status/headers
+    /// go out before the body exists.
+    async fn handle_http(req: HttpRequest) -> Result<HttpResponse, PluginError> {
+        if !req.uri.starts_with("/download") {
+            return Err(PluginError::NotFound);
+        }
+
+        let total: u64 = req
+            .uri
+            .split_once('?')
+            .and_then(|(_, qs)| {
+                qs.split('&')
+                    .find_map(|kv| kv.strip_prefix("bytes="))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(1024 * 1024)
+            .min(256 * 1024 * 1024);
+
+        // The request body is never read, so none of it is lowered into guest
+        // memory — dropping the reader is enough.
+        drop(req.body);
+
+        let (mut body_tx, body_rx) = wit_stream::new::<u8>();
+        wit_bindgen::spawn_local(async move {
+            let mut sent = 0u64;
+            while sent < total {
+                let n = BODY_CHUNK.min((total - sent) as usize);
+                body_tx.write_all(vec![b'x'; n]).await;
+                sent += n as u64;
+            }
+            drop(body_tx);
+        });
+
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: body_rx,
+        })
     }
 
     async fn handle_websocket(

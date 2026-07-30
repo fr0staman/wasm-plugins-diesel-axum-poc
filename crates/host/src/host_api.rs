@@ -7,12 +7,19 @@ use crate::context::SharedCache;
 use crate::db::DbPool;
 use crate::dispatcher::Dispatcher;
 use crate::validation::{ValidationCache, validate_table_access_cached};
+use std::future::Future;
 use std::sync::Arc;
 use wasmtime::component::{Accessor, HasSelf, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 pub struct PluginState {
     pub wasi: WasiCtx,
+    /// SPIKE: state for the wasi:http host implementation.
+    pub http: wasmtime_wasi_http::WasiHttpCtx,
+    /// Hooks are only consulted for *outbound* requests, which plugins cannot
+    /// make — the `client` interface is unused here. Implementing the trait
+    /// directly avoids the `default-send-request` feature and its TLS stack.
+    pub http_hooks: NoHttpHooks,
     pub table: ResourceTable,
     pub db: Option<Arc<DbPool>>,
     pub cache: SharedCache,
@@ -30,6 +37,56 @@ pub fn new_conn_id() -> u64 {
 
 // Empty marker trait required by Plugin::add_to_linker
 impl TypesHost for PluginState {}
+
+/// No-op `wasi:http` hooks; every trait method has a default.
+#[derive(Default)]
+pub struct NoHttpHooks;
+impl wasmtime_wasi_http::p3::WasiHttpHooks for NoHttpHooks {
+    fn send_request(
+        &mut self,
+        _req: axum::http::Request<
+            http_body_util::combinators::UnsyncBoxBody<
+                axum::body::Bytes,
+                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+            >,
+        >,
+        _opts: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        _fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::p3::bindings::http::types::ErrorCode>> + Send + 'static>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        axum::http::Response<
+                            http_body_util::combinators::UnsyncBoxBody<
+                                axum::body::Bytes,
+                                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                            >,
+                        >,
+                        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::p3::bindings::http::types::ErrorCode>> + Send + 'static>,
+                    ),
+                    wasmtime_wasi::TrappableError<
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                    >,
+                >,
+            > + Send
+            + 'static,
+    > {
+        // Plugins are servers, not clients: outbound HTTP is deliberately denied.
+        Box::new(async {
+            Err(wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::HttpRequestDenied.into())
+        })
+    }
+}
+
+impl wasmtime_wasi_http::p3::WasiHttpView for PluginState {
+    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p3::WasiHttpCtxView {
+            hooks: &mut self.http_hooks,
+            table: &mut self.table,
+            ctx: &mut self.http,
+        }
+    }
+}
 
 impl WasiView for PluginState {
     fn ctx(&mut self) -> WasiCtxView<'_> {

@@ -11,7 +11,19 @@ version = "0.1.0"
 
 [workspace.dependencies]
 # Wasmtime
-wasmtime         = { version = "47.0.2", features = ["component-model-async", "parallel-compilation"] }
+# Trimmed from wasmtime's default set. Dropped: gc/gc-copying/gc-drc/gc-null
+# (no wasm GC in these components), wat (we load .wasm, never text), threads,
+# coredump, profiling, cache, debug, wit-parser, compile-time-builtins.
+# Kept backtrace/demangle/addr2line — they are what makes a plugin trap
+# readable ("wasm backtrace: ..."), which this project relies on.
+wasmtime         = { version = "47.0.2", default-features = false, features = [
+    # "anyhow" makes wasmtime::Error be anyhow::Error, which the host relies on
+    # for `?` conversions throughout runtime.rs.
+    "anyhow",
+    "runtime", "std", "cranelift", "component-model", "component-model-async",
+    "async", "pooling-allocator", "parallel-compilation",
+    "backtrace", "demangle", "addr2line",
+] }
 # "p2" is required, not implied by "p3": guests still get their WASI imports from
 # the wasm32-wasip2 target (wasi:*@0.2.12). Without it the p2 module still compiles
 # but its interfaces are never registered, and every plugin fails to instantiate.
@@ -27,7 +39,10 @@ sqlparser         = { version = "0.62.0", features = ["visitor"] }
 futures-util      = { version = "0.3.33", default-features = false }
 
 # Async runtime
-tokio            = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+# `sync` and `net` are used directly (mpsc/oneshot/broadcast, TcpListener) and
+# must be declared: they currently resolve only because axum/hyper happen to
+# enable them, which is not a guarantee.
+tokio            = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "net"] }
 
 # Tracing
 tracing          = { version = "0.1.44" }

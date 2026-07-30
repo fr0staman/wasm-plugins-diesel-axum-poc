@@ -11,11 +11,13 @@ use wasmtime::{
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::bindings::myapp::plugin::types::{
-    EventEnvelope, EventPayload, EventSource, EventSubscription, HttpRequest, HttpResponse,
-    SystemEvent, SystemEventKind, WsMessage,
+    EventEnvelope, EventPayload, EventSource, EventSubscription, HttpRequest,
+    HttpHeader, SystemEvent, SystemEventKind, WsMessage,
 };
 use crate::bindings::{Plugin, PluginPre};
-use crate::streams::{ChannelConsumer, ChannelProducer, OneshotConsumer};
+use crate::streams::{
+    ByteChannelConsumer, ByteChannelProducer, ChannelConsumer, ChannelProducer, OneshotConsumer,
+};
 use crate::context::SharedCache;
 use crate::db::DbPool;
 use crate::dispatcher::Dispatcher;
@@ -116,6 +118,12 @@ async fn await_terminal(
     }
 }
 
+/// Per-invocation fuel for HTTP and event handlers. Runaway computation traps.
+const HTTP_FUEL: u64 = 10_000_000;
+
+/// Depth of the host-side frame buffer for a wasi:http response body.
+const STREAM_BUFFER: usize = 32;
+
 impl PluginExecutor {
     fn make_store(&self, plugin_name: &str, chain_depth: u8) -> Store<PluginState> {
         let wasi = WasiCtxBuilder::new().inherit_stderr().build();
@@ -125,19 +133,23 @@ impl PluginExecutor {
             db: self.db.clone(),
             cache: self.cache.clone(),
             dispatcher: self.dispatcher.clone(),
+            http: wasmtime_wasi_http::WasiHttpCtx::default(),
+            http_hooks: Default::default(),
             plugin_name: plugin_name.to_string(),
             validation_cache: self.validation_cache.clone(),
             current_chain_depth: chain_depth,
         };
         let mut store = Store::new(&self.engine, state);
-        store.set_fuel(10_000_000).ok();
+        store.set_fuel(HTTP_FUEL).ok();
         store
     }
 
-    /// Store for a long-lived streaming connection (WS/SSE).
-    /// consume_fuel is enabled engine-wide; u64::MAX = no practical limit, since
-    /// these run for the lifetime of the connection.
-    fn make_store_streaming(&self, plugin_name: &str) -> Store<PluginState> {
+    /// Store for a streaming invocation. `fuel` is the per-invocation budget:
+    /// `u64::MAX` for WS/SSE, which run for the lifetime of a connection and
+    /// would exhaust any fixed budget, but a real limit for HTTP — that budget
+    /// is a sandboxing control, and handing HTTP an unlimited one would quietly
+    /// remove it.
+    fn make_store_streaming(&self, plugin_name: &str, fuel: u64) -> Store<PluginState> {
         let wasi = WasiCtxBuilder::new().inherit_stderr().build();
         let state = PluginState {
             wasi,
@@ -145,12 +157,14 @@ impl PluginExecutor {
             db: self.db.clone(),
             cache: self.cache.clone(),
             dispatcher: self.dispatcher.clone(),
+            http: wasmtime_wasi_http::WasiHttpCtx::default(),
+            http_hooks: Default::default(),
             plugin_name: plugin_name.to_string(),
             validation_cache: self.validation_cache.clone(),
             current_chain_depth: 0,
         };
         let mut store = Store::new(&self.engine, state);
-        store.set_fuel(u64::MAX).ok();
+        store.set_fuel(fuel).ok();
         store
     }
 
@@ -170,7 +184,7 @@ impl PluginExecutor {
         inbound: mpsc::Receiver<WsMessage>,
         outbound: mpsc::Sender<Vec<WsMessage>>,
     ) -> anyhow::Result<()> {
-        let mut store = self.make_store_streaming(plugin_name);
+        let mut store = self.make_store_streaming(plugin_name, u64::MAX);
         let instance = pre.instantiate_async(&mut store).await?;
 
         store
@@ -203,7 +217,7 @@ impl PluginExecutor {
         conn_id: u64,
         outbound: mpsc::Sender<Vec<Vec<u8>>>,
     ) -> anyhow::Result<()> {
-        let mut store = self.make_store_streaming(plugin_name);
+        let mut store = self.make_store_streaming(plugin_name, u64::MAX);
         let instance = pre.instantiate_async(&mut store).await?;
 
         store
@@ -222,24 +236,64 @@ impl PluginExecutor {
             .await?
     }
 
+    /// Runs a plugin HTTP request.
+    ///
+    /// The request body is fed in as a stream, so a handler that never reads it
+    /// costs nothing — the bytes are only lowered into guest memory on demand.
+    /// Status and headers come back as soon as the guest returns them; the
+    /// response body keeps flowing on `body_tx` while this future runs, so the
+    /// caller must drive both concurrently.
     pub async fn call_http(
         &self,
         plugin_name: &str,
         pre: &PluginPre<PluginState>,
-        req: HttpRequest,
-    ) -> Result<HttpResponse> {
-        let mut store = self.make_store(plugin_name, 0);
+        method: String,
+        uri: String,
+        headers: Vec<HttpHeader>,
+        body: mpsc::Receiver<Vec<u8>>,
+        head_tx: tokio::sync::oneshot::Sender<(u16, Vec<HttpHeader>)>,
+        body_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<()> {
+        let mut store = self.make_store_streaming(plugin_name, HTTP_FUEL);
         let instance = pre.instantiate_async(&mut store).await?;
 
         store
-            .run_concurrent(async move |accessor| {
-                instance
+            .run_concurrent(async move |accessor: &Accessor<PluginState>| -> Result<()> {
+                let body = accessor.with(|mut store: Access<'_, PluginState>| {
+                    StreamReader::new(store.as_context_mut(), ByteChannelProducer::new(body))
+                })?;
+
+                let req = HttpRequest {
+                    method,
+                    uri,
+                    headers,
+                    body,
+                };
+                let resp = instance
                     .myapp_plugin_plugin_api()
                     .call_handle_http(accessor, req)
-                    .await
+                    .await?
+                    .map_err(|e| anyhow!("plugin error: {:?}", e))?;
+
+                // Hand the caller status+headers immediately so axum can start
+                // the response while the guest is still producing the body.
+                let _ = head_tx.send((resp.status, resp.headers));
+
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                accessor.with(|mut store: Access<'_, PluginState>| {
+                    resp.body.pipe(
+                        store.as_context_mut(),
+                        ByteChannelConsumer::new(body_tx, done_tx),
+                    )
+                })?;
+
+                // Stay inside run_concurrent until the guest has written the
+                // whole body, otherwise the store is torn down mid-write and
+                // the client gets an empty response.
+                let _ = done_rx.await;
+                Ok(())
             })
-            .await??
-            .map_err(|e| anyhow!("plugin error: {:?}", e))
+            .await?
     }
 
     pub async fn call_event(
@@ -326,6 +380,8 @@ impl PluginRuntime {
         // "component imports instance `wasi:io/poll@0.2.x`".
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+        // SPIKE: serve wasi:http types so plugins can export wasi:http/handler.
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
 
         let db = match DbPool::new(database_url).await {
@@ -472,6 +528,17 @@ impl PluginRuntime {
             plugin.instance_pre.clone(),
             is_protected,
         ))
+    }
+
+    /// SPIKE: look a plugin up by name only. A `wasi:http` service routes its own
+    /// requests, so the host does not pre-validate the path the way
+    /// `prepare_http_with_auth` does for `handle-http`.
+    pub fn prepare_wasi_http(
+        &self,
+        plugin_name: &str,
+    ) -> Option<(Arc<PluginExecutor>, PluginPre<PluginState>)> {
+        let plugin = self.plugins.iter().find(|p| p.name == plugin_name)?;
+        Some((Arc::clone(&self.executor), plugin.instance_pre.clone()))
     }
 
     /// Returns executor + pre-linked instance + auth flag for a WebSocket upgrade,
@@ -1065,4 +1132,92 @@ mod tests {
     fn ws_sse_protected_empty_list() {
         assert!(!ws_sse_route_is_protected(&[], "/chat"));
     }
+}
+
+// ── SPIKE: wasi:http/handler call path ────────────────────────────────────────
+
+/// Calls a plugin's standard `wasi:http/handler` export.
+///
+/// wasmtime-wasi-http supplies the request/response conversions, but not the
+/// store lifetime: `into_http` hands back a body that reads from the component,
+/// so `run_concurrent` has to stay alive until that body is drained. The wasm
+/// side therefore runs on its own task, streaming frames into a bounded channel,
+/// while the caller returns as soon as status and headers are known.
+pub async fn call_wasi_http(
+    executor: &PluginExecutor,
+    plugin_name: &str,
+    pre: &PluginPre<PluginState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Result<axum::http::Response<axum::body::Body>> {
+    use http_body_util::BodyExt as _;
+    use wasmtime_wasi_http::p3::bindings::ServicePre;
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::p3::{Request as WasiRequest, Response as WasiResponse};
+
+    let mut store = executor.make_store_streaming(plugin_name, HTTP_FUEL);
+    let service_pre = ServicePre::new(pre.instance_pre().clone())?;
+    let service = service_pre.instantiate_async(&mut store).await?;
+
+    // axum's body error type is its own; wasi:http wants ErrorCode.
+    let (parts, body) = req.into_parts();
+    let body = body.map_err(|e| ErrorCode::InternalError(Some(e.to_string())));
+    let req = axum::http::Request::from_parts(parts, body);
+    let (wasi_req, req_io) = WasiRequest::from_http(req);
+
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<axum::body::Bytes>(STREAM_BUFFER);
+    let plugin = plugin_name.to_string();
+
+    let task = tokio::spawn(async move {
+        store
+            .run_concurrent(async move |accessor: &Accessor<PluginState>| -> Result<()> {
+                let resp: WasiResponse = service
+                    .handle(accessor, wasi_req)
+                    .await?
+                    .map_err(|e| anyhow!("wasi:http plugin error: {e:?}"))?;
+
+                let http = accessor.with(|mut store: Access<'_, PluginState>| {
+                    resp.into_http(store.as_context_mut(), req_io)
+                })?;
+
+                let (parts, mut body) = http.into_parts();
+                let _ = head_tx.send(parts);
+
+                // Draining here is what keeps the store alive; the channel is
+                // bounded, so a slow client backs up into the plugin.
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.map_err(|e| anyhow!("wasi:http body error: {e:?}"))?;
+                    if let Ok(data) = frame.into_data()
+                        && frame_tx.send(data).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .await?
+    });
+
+    let Ok(parts) = head_rx.await else {
+        let msg = match task.await {
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(())) => "plugin returned no response".to_string(),
+            Err(e) => e.to_string(),
+        };
+        anyhow::bail!(msg);
+    };
+
+    let stream = async_stream::stream! {
+        while let Some(chunk) = frame_rx.recv().await {
+            yield Ok::<_, std::convert::Infallible>(chunk);
+        }
+        if let Ok(Err(e)) = task.await {
+            tracing::error!(plugin = %plugin, error = %e, "wasi:http plugin error");
+        }
+    };
+
+    Ok(axum::http::Response::from_parts(
+        parts,
+        axum::body::Body::from_stream(stream),
+    ))
 }

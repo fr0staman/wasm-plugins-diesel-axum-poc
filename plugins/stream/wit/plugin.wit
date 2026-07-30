@@ -6,17 +6,23 @@ interface types {
         value: string,
     }
 
+    /// `body` is a stream, not a buffer: the host never materialises a request
+    /// body in guest memory, and a handler that ignores the body pays nothing
+    /// for it. Read it with `read` until the stream is dropped.
     record http-request {
         method: string,
         uri: string,
         headers: list<http-header>,
-        body: option<list<u8>>,
+        body: stream<u8>,
     }
 
+    /// The plugin returns status and headers as soon as they are known and keeps
+    /// writing `body` afterwards, so the host can start responding before the
+    /// body is complete.
     record http-response {
         status: u16,
         headers: list<http-header>,
-        body: option<list<u8>>,
+        body: stream<u8>,
     }
 
     record user-snapshot {
@@ -215,4 +221,14 @@ world plugin {
 world plugin-guest {
     include plugin;
     import wasi:clocks/monotonic-clock@0.3.0;
+
+}
+
+/// SPIKE: `plugin-guest` plus the standard wasi:http entry point. A plugin in
+/// this world is also a plain wasi:http service, so the host can call it through
+/// wasmtime-wasi-http's `Service` bindings instead of hand-converting requests
+/// and bodies. Only `plugins/stream` uses this while the approach is evaluated.
+world plugin-http-guest {
+    include plugin-guest;
+    export wasi:http/handler@0.3.0;
 }

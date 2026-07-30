@@ -78,6 +78,138 @@ where
     }
 }
 
+/// Bytes moved per crossing on a `stream<u8>` body.
+///
+/// Bodies are byte streams, so an "item" is one byte and batching matters far
+/// more than it does for message streams: 64 KiB is one crossing instead of
+/// 65536.
+pub const BYTE_CHUNK: usize = 64 * 1024;
+
+/// Feeds a guest `stream<u8>` (an HTTP request body) from chunks on a channel.
+///
+/// Nothing is lowered into guest memory until the guest actually reads, so a
+/// handler that ignores the body costs nothing regardless of its size.
+pub struct ByteChannelProducer {
+    rx: mpsc::Receiver<Vec<u8>>,
+    /// Chunk currently being handed to the guest, and how much of it has gone.
+    /// A chunk can be larger than the guest's read buffer, so it is consumed
+    /// across several polls.
+    cur: Vec<u8>,
+    pos: usize,
+}
+
+impl ByteChannelProducer {
+    pub fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            cur: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl<D> StreamProducer<D> for ByteChannelProducer {
+    type Item = u8;
+    type Buffer = VecBuffer<u8>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let me = self.get_mut();
+
+        if me.pos == me.cur.len() {
+            match me.rx.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    me.cur = chunk;
+                    me.pos = 0;
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(StreamResult::Dropped)),
+                Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let src = &me.cur[me.pos..];
+
+        // Byte streams get a direct view of the guest's read buffer, so this is
+        // a memcpy. Going through `Destination::set_buffer` instead costs ~6x on
+        // a 1 MiB body, because that path moves bytes as individual items.
+        let mut direct = dst.as_direct(store, src.len());
+        let out = direct.remaining();
+        let n = out.len().min(src.len());
+        out[..n].copy_from_slice(&src[..n]);
+        direct.mark_written(n);
+        me.pos += n;
+
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+/// Drains a guest `stream<u8>` (an HTTP response body) into a bounded channel of
+/// chunks, so the host can start responding before the body is complete.
+pub struct ByteChannelConsumer {
+    tx: PollSender<Vec<u8>>,
+    /// Fired when this consumer is dropped, i.e. once the guest has finished
+    /// writing the body. The caller must await it before letting the store go:
+    /// unlike WS/SSE there is no terminal future here, so without this signal
+    /// `run_concurrent` returns while the guest still has body to write, the
+    /// store is torn down, and the response comes back empty.
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl ByteChannelConsumer {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>, done: oneshot::Sender<()>) -> Self {
+        Self {
+            tx: PollSender::new(tx),
+            done: Some(done),
+        }
+    }
+}
+
+impl Drop for ByteChannelConsumer {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+impl<D> StreamConsumer<D> for ByteChannelConsumer {
+    type Item = u8;
+
+    fn poll_consume<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'a, D>,
+        mut source: Source<'a, Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let me = self.get_mut();
+
+        match me.tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => return Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(BYTE_CHUNK);
+        source.read(store.as_context_mut(), &mut buf)?;
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        if me.tx.send_item(buf).is_err() {
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        }
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
 /// Delivers a guest-written `future<T>` into a oneshot channel.
 ///
 /// Host `FutureReader`s cannot be awaited directly — like streams they are

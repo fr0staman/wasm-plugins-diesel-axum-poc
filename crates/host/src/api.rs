@@ -47,6 +47,13 @@ pub fn router(runtime: SharedRuntime, auth: Arc<AuthConfig>) -> Router {
         .split_for_parts();
 
     let root_router = root_router
+        // SPIKE: same plugins, reached through their standard wasi:http/handler
+        // export instead of plugin-api's handle-http. Left outside the OpenAPI
+        // router deliberately — it is an A/B path, not a documented endpoint.
+        .route(
+            "/h/{plugin_name}/{*path}",
+            axum::routing::any(crate::routes::plugins::wasi_http_handler),
+        )
         .route(
             "/api-docs/openapi.json",
             get(async |state| crate::routes::other::openapi_json(state, openapi).await),
