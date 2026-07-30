@@ -16,7 +16,7 @@ use crate::bindings::myapp::plugin::types::{
 };
 use crate::bindings::{Plugin, PluginPre};
 use crate::streams::{
-    ByteChannelConsumer, ByteChannelProducer, ChannelConsumer, ChannelProducer, OneshotConsumer,
+    ByteChannelConsumer, ChannelConsumer, ChannelProducer, OneshotConsumer,
 };
 use crate::context::SharedCache;
 use crate::db::DbPool;
@@ -250,7 +250,7 @@ impl PluginExecutor {
         method: String,
         uri: String,
         headers: Vec<HttpHeader>,
-        body: mpsc::Receiver<Vec<u8>>,
+        body: Vec<u8>,
         head_tx: tokio::sync::oneshot::Sender<(u16, Vec<HttpHeader>)>,
         body_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
@@ -259,8 +259,12 @@ impl PluginExecutor {
 
         store
             .run_concurrent(async move |accessor: &Accessor<PluginState>| -> Result<()> {
+                // axum already handed us the whole request body, so feed the Vec
+                // straight in as the stream producer. Routing it through an mpsc
+                // channel (as this did) allocated a 32-slot ring and a send per
+                // request to move bytes we already had.
                 let body = accessor.with(|mut store: Access<'_, PluginState>| {
-                    StreamReader::new(store.as_context_mut(), ByteChannelProducer::new(body))
+                    StreamReader::new(store.as_context_mut(), body)
                 })?;
 
                 let req = HttpRequest {
@@ -358,16 +362,32 @@ impl PluginRuntime {
         config.consume_fuel(true);
 
         let mut pool = PoolingAllocationConfig::default();
-        pool.total_memories(64);
-        pool.total_tables(64);
+        // These cap *concurrent* instances, so they are a hard RPS ceiling:
+        // past this many in-flight plugin calls, instantiation fails and the
+        // request 502s. 64 was reachable with keep-alive at c=64.
+        pool.total_memories(1024);
+        pool.total_tables(1024);
         pool.max_memories_per_component(1);
         // Instantiation is the dominant per-request cost, so bias the pool for
         // slot reuse over RSS: prefer affine (same-module) slots, and reset
         // small regions with memset instead of madvise so a reused slot does
         // not fault its pages back in.
         pool.max_unused_warm_slots(0);
-        pool.linear_memory_keep_resident(2 << 20);
-        pool.table_keep_resident(64 << 10);
+        // Keep this at 0. `keep_resident` trades one madvise on instance teardown
+        // for a memset of that many bytes, and the memset loses badly once it is
+        // more than a few pages — measured on /p/bonus/status at c=16:
+        //
+        //        0 -> 370 us CPU/req,  ~10k RPS
+        //    64 KiB -> 379 us,         ~10k RPS
+        //   256 KiB -> 431 us,          9.2k RPS
+        //     1 MiB -> 810 us,          5.5k RPS
+        //
+        // An earlier 2 MiB setting here halved throughput. It looked like a 23%
+        // win in a single-threaded microbenchmark, because memsetting the slot
+        // keeps its pages warm for the very next instantiation in a tight loop —
+        // the opposite of what happens when many slots cycle concurrently.
+        pool.linear_memory_keep_resident(0);
+        pool.table_keep_resident(0);
 
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 

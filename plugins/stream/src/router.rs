@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use axum::{Router, http::StatusCode};
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -45,13 +43,20 @@ async fn download() -> StatusCode {
     StatusCode::OK
 }
 
-static ROUTER: LazyLock<(Router, utoipa::openapi::OpenApi)> = LazyLock::new(|| {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+
+/// The route table, stated once.
+///
+/// A plain function, not a `LazyLock`: the host creates a fresh instance per
+/// call, so a `LazyLock` initializer would run every time it was used anyway.
+/// This plugin dispatches in `handle_http` rather than through the returned
+/// `Router`, but `manifest()` is the only caller, so it costs nothing per request.
+fn router() -> (Router, utoipa::openapi::OpenApi) {
+    OpenApiRouter::<()>::with_openapi(ApiDoc::openapi())
         .routes(routes!(sse_generate))
         .routes(routes!(download))
         .split_for_parts()
-});
+}
 
 pub fn openapi_json() -> String {
-    serde_json::to_string(&ROUTER.1).unwrap_or_default()
+    serde_json::to_string(&router().1).unwrap_or_default()
 }

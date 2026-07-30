@@ -78,76 +78,12 @@ where
     }
 }
 
-/// Bytes moved per crossing on a `stream<u8>` body.
+/// Bytes moved per crossing when draining a `stream<u8>` body.
 ///
 /// Bodies are byte streams, so an "item" is one byte and batching matters far
 /// more than it does for message streams: 64 KiB is one crossing instead of
 /// 65536.
 pub const BYTE_CHUNK: usize = 64 * 1024;
-
-/// Feeds a guest `stream<u8>` (an HTTP request body) from chunks on a channel.
-///
-/// Nothing is lowered into guest memory until the guest actually reads, so a
-/// handler that ignores the body costs nothing regardless of its size.
-pub struct ByteChannelProducer {
-    rx: mpsc::Receiver<Vec<u8>>,
-    /// Chunk currently being handed to the guest, and how much of it has gone.
-    /// A chunk can be larger than the guest's read buffer, so it is consumed
-    /// across several polls.
-    cur: Vec<u8>,
-    pos: usize,
-}
-
-impl ByteChannelProducer {
-    pub fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx,
-            cur: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl<D> StreamProducer<D> for ByteChannelProducer {
-    type Item = u8;
-    type Buffer = VecBuffer<u8>;
-
-    fn poll_produce<'a>(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        store: StoreContextMut<'a, D>,
-        dst: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        let me = self.get_mut();
-
-        if me.pos == me.cur.len() {
-            match me.rx.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => {
-                    me.cur = chunk;
-                    me.pos = 0;
-                }
-                Poll::Ready(None) => return Poll::Ready(Ok(StreamResult::Dropped)),
-                Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let src = &me.cur[me.pos..];
-
-        // Byte streams get a direct view of the guest's read buffer, so this is
-        // a memcpy. Going through `Destination::set_buffer` instead costs ~6x on
-        // a 1 MiB body, because that path moves bytes as individual items.
-        let mut direct = dst.as_direct(store, src.len());
-        let out = direct.remaining();
-        let n = out.len().min(src.len());
-        out[..n].copy_from_slice(&src[..n]);
-        direct.mark_written(n);
-        me.pos += n;
-
-        Poll::Ready(Ok(StreamResult::Completed))
-    }
-}
 
 /// Drains a guest `stream<u8>` (an HTTP response body) into a bounded channel of
 /// chunks, so the host can start responding before the body is complete.

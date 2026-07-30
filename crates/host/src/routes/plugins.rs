@@ -178,7 +178,6 @@ pub async fn plugin_handler(
     // Request body in, response body out — both streamed. The wasm task runs on
     // its own tokio task so axum can begin sending the response while the plugin
     // is still writing it.
-    let (req_tx, req_rx) = mpsc::channel::<Vec<u8>>(STREAM_BUFFER);
     let (head_tx, head_rx) = tokio::sync::oneshot::channel::<(u16, Vec<HttpHeader>)>();
     let (resp_tx, mut resp_rx) = mpsc::channel::<Vec<u8>>(STREAM_BUFFER);
 
@@ -192,20 +191,12 @@ pub async fn plugin_handler(
                 method_s,
                 plugin_uri,
                 forwarded,
-                req_rx,
+                body.to_vec(),
                 head_tx,
                 resp_tx,
             )
             .await
     });
-
-    // Feed the (already collected) request body in. Kept as one send because the
-    // axum extractor hands us the whole buffer; the win is that the guest only
-    // pulls what it reads.
-    if !body.is_empty() {
-        let _ = req_tx.send(body.to_vec()).await;
-    }
-    drop(req_tx);
 
     let Ok((status, headers)) = head_rx.await else {
         // No head means the plugin failed before returning a response.

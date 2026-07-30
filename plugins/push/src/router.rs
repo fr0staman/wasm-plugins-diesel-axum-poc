@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use crate::bindings::myapp::plugin::types::{HttpHeader, HttpRequest, HttpResponse, PluginError};
 use crate::bindings::wit_stream;
 use axum::{
@@ -18,13 +16,19 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 )]
 struct ApiDoc;
 
-static ROUTER: LazyLock<(Router, utoipa::openapi::OpenApi)> = LazyLock::new(|| {
+/// The route table, stated once and used by both `dispatch` and
+/// `openapi_json`.
+///
+/// Deliberately a plain function rather than a `LazyLock`: the host creates a
+/// fresh instance for every HTTP call, so a `LazyLock` initializer would run
+/// once per request regardless and the once-init machinery bought nothing.
+fn router() -> (Router, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(crate::handlers::get_status))
         .routes(routes!(crate::handlers::post_send))
         .routes(routes!(crate::handlers::get_notifications))
         .split_for_parts()
-});
+}
 
 pub async fn dispatch(req: HttpRequest) -> Result<HttpResponse, PluginError> {
     let mut builder = Request::builder()
@@ -42,7 +46,7 @@ pub async fn dispatch(req: HttpRequest) -> Result<HttpResponse, PluginError> {
     let body = read_body(req.body, hint).await;
     let request = builder.body(Body::from(body)).unwrap();
 
-    let response = ROUTER.0.clone().oneshot(request).await.unwrap();
+    let response = router().0.oneshot(request).await.unwrap();
 
     response_to_wit(response).await
 }
@@ -113,6 +117,7 @@ async fn response_to_wit(resp: Response<Body>) -> Result<HttpResponse, PluginErr
     })
 }
 
+/// Load path only — called once per plugin load.
 pub fn openapi_json() -> String {
-    serde_json::to_string(&ROUTER.1).unwrap_or_default()
+    serde_json::to_string(&router().1).unwrap_or_default()
 }
