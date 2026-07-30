@@ -205,6 +205,8 @@ pub async fn plugin_handler(
             Ok(Ok(())) => "plugin returned no response".to_string(),
             Err(e) => e.to_string(),
         };
+        
+        tracing::error!(plugin = %plugin_name, error = %msg, "plugin http call failed");
         return (StatusCode::BAD_GATEWAY, msg).into_response();
     };
 
@@ -536,6 +538,9 @@ pub async fn wasi_http_handler(
 
     match crate::runtime::call_wasi_http(&executor, &plugin_name, &plugin_pre, req).await {
         Ok(resp) => resp.into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(plugin = %plugin_name, error = %e, "wasi:http plugin call failed");
+            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+        }
     }
 }
