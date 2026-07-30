@@ -24,11 +24,10 @@ utoipa           = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 anyhow           = { workspace = true }
-dashmap          = { workspace = true }
 config           = { workspace = true }
 matchit  = "0.8"
 dotenvy  = "0.15.7"
 futures-util = { workspace = true }
 async-stream  = "0.3"
-jsonwebtoken  = "9"
+jsonwebtoken  = "11"
 utoipa-axum = "0.2.0"

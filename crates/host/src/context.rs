@@ -1,5 +1,5 @@
-use dashmap::DashMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 struct Entry {
@@ -9,7 +9,7 @@ struct Entry {
 
 #[derive(Clone, Default)]
 pub struct SharedCache {
-    inner: Arc<DashMap<String, Entry>>,
+    inner: Arc<RwLock<HashMap<String, Entry>>>,
 }
 
 impl SharedCache {
@@ -18,17 +18,27 @@ impl SharedCache {
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let entry = self.inner.get(key)?;
-        if entry.expires_at < Instant::now() {
-            drop(entry);
-            self.inner.remove(key);
-            return None;
+        // Take the value under a read guard; only an expired entry needs the
+        // write lock, and the guard is released before upgrading.
+        let expired = {
+            let map = self.inner.read().expect("cache poisoned");
+            let entry = map.get(key)?;
+            if entry.expires_at >= Instant::now() {
+                return Some(entry.value.clone());
+            }
+            true
+        };
+        if expired {
+            self.inner.write().expect("cache poisoned").remove(key);
         }
-        Some(entry.value.clone())
+        None
     }
 
     pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: u32) {
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
-        self.inner.insert(key, Entry { value, expires_at });
+        self.inner
+            .write()
+            .expect("cache poisoned")
+            .insert(key, Entry { value, expires_at });
     }
 }

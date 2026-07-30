@@ -1,20 +1,22 @@
 use anyhow::{Result, bail};
-use dashmap::DashMap;
 use sqlparser::ast::visit_relations;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Shared cache for SQL validation results.
 /// Key: hash of `(plugin_name, sql)`, value: `None` = valid, `Some(msg)` = rejected.
 /// Keyed by `u64` to avoid a heap allocation on every cache lookup.
-pub type ValidationCache = Arc<DashMap<u64, Option<String>>>;
+/// Write-once-then-read-only in practice: an entry is added the first time a
+/// given statement is seen, so after warmup this is pure shared-read.
+pub type ValidationCache = Arc<RwLock<HashMap<u64, Option<String>>>>;
 
 pub fn new_validation_cache() -> ValidationCache {
-    Arc::new(DashMap::new())
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
 #[inline]
@@ -33,14 +35,19 @@ pub fn validate_table_access_cached(
     plugin_name: &str,
 ) -> Result<()> {
     let key = validation_key(plugin_name, sql);
-    if let Some(entry) = cache.get(&key) {
-        return match entry.value() {
+    // Read guard is dropped before parsing: `validate_table_access` is slow and
+    // must not be run while holding the lock.
+    if let Some(entry) = cache.read().expect("validation cache poisoned").get(&key) {
+        return match entry {
             None => Ok(()),
             Some(msg) => bail!("{msg}"),
         };
     }
     let result = validate_table_access(sql, plugin_name);
-    cache.insert(key, result.as_ref().err().map(|e| e.to_string()));
+    cache
+        .write()
+        .expect("validation cache poisoned")
+        .insert(key, result.as_ref().err().map(|e| e.to_string()));
     result
 }
 

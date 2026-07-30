@@ -30,7 +30,7 @@ wasmtime         = { version = "47.0.2", default-features = false, features = [
 wasmtime-wasi    = { version = "47.0.2", default-features = false, features = ["p2", "p3"] }
 
 # Diesel / DB
-diesel           = { version = "2.3.9", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel           = { version = "2.3.11", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 diesel-async     = { version = "0.9.2", features = ["deadpool", "postgres"] }
 
 
@@ -60,7 +60,6 @@ serde_json       = { version = "1.0.151" }
 
 # Misc
 anyhow           = { version = "1.0.104" }
-dashmap          = { version = "6.2.1" }
 
 config           = { version = "0.15.25", default-features = false }
 
