@@ -197,7 +197,22 @@ interface plugin-api {
         -> tuple<stream<list<u8>>, future<result<_, plugin-error>>>;
 }
 
+/// The contract the host implements and calls. WASI is deliberately absent:
+/// the host serves it through `p2::add_to_linker` / `p3::add_to_linker`, not
+/// through these bindings.
 world plugin {
     import host-api;
     export plugin-api;
+}
+
+/// What plugins generate against: everything in `plugin`, plus the WASI 0.3
+/// interfaces they may call directly.
+///
+/// Real WASI 0.3, imported alongside the wasi:*@0.2.x that std pulls in on the
+/// wasm32-wasip2 target — the host links both, so a plugin can await `wait-for`
+/// with none of the 0.2 pollable dance. This is what makes timers possible
+/// inside a plugin at all.
+world plugin-guest {
+    include plugin;
+    import wasi:clocks/monotonic-clock@0.3.0;
 }

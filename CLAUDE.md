@@ -55,6 +55,10 @@ and given sandboxed access to a shared Postgres database.
 3. **WS / SSE** — `prepare_websocket` / `prepare_sse` validate the path and return an auth flag.
    If protected, the JWT is verified on the initial HTTP upgrade/request before the connection
    is established. WS/SSE stores use `u64::MAX` fuel (long-lived; not subject to per-call budget).
+   Traffic itself moves over **component-model streams**, not per-message host calls: the
+   handler receives/returns `stream<T>` plus a terminal `future<result<_, plugin-error>>`.
+   `crates/host/src/streams.rs` bridges those to bounded tokio channels — bounded so a slow
+   client applies backpressure to the plugin instead of growing a host-side buffer.
 4. **Events** — `collect_event_handlers` snapshots handlers, releases the lock,
    then `call_event` runs each WASM handler concurrently.
 5. **DB** — Plugins build queries with Diesel (compile-time type-checked), render
@@ -71,8 +75,26 @@ and given sandboxed access to a shared Postgres database.
 ## WIT contract (`wit/plugin.wit`)
 
 The WIT file is the only source of truth. Both sides generate from it:
-- **Host** — `wasmtime::component::bindgen!` reads it at `cargo build` time.
-- **Plugins** — `wit_bindgen::generate!` in `src/lib.rs` regenerates `bindings` at `cargo build` time.
+- **Host** — `wasmtime::component::bindgen!` reads it at `cargo build` time, against `world plugin`.
+- **Plugins** — `wit_bindgen::generate!` in `src/lib.rs` regenerates `bindings` at `cargo build`
+  time, against `world plugin-guest`.
+
+There are two worlds on purpose:
+
+| World | Contents | Used by |
+|-------|----------|---------|
+| `plugin` | `import host-api` + `export plugin-api` | host `bindgen!` |
+| `plugin-guest` | `include plugin` + `import wasi:clocks/monotonic-clock@0.3.0` | plugin `generate!` |
+
+WASI is deliberately absent from `plugin`: the host serves it through
+`p2::add_to_linker` + `p3::add_to_linker`, not through these bindings. Putting a WASI import
+into `plugin` makes the host bindgen demand a `Host` impl for it and makes
+`Plugin::add_to_linker` fight `p3::add_to_linker` over the same interface.
+
+Plugins get **both** WASI versions: `wasi:*@0.2.x` comes from std on the `wasm32-wasip2`
+target, and `wasi:clocks@0.3.0` is imported explicitly. Both linkers are registered, so both
+resolve. Dropping the p2 line makes every plugin fail to instantiate with
+"component imports instance `wasi:io/poll@0.2.x`".
 
 ### Key types
 
@@ -88,6 +110,12 @@ The WIT file is the only source of truth. Both sides generate from it:
 | `payment-snapshot` | Read-only view of a payment passed in `payment-made` events |
 | `rendered-query` | SQL + binary bind values rendered by Diesel on the WASM side |
 | `plugin-error` | `db-error \| invalid-input \| not-found \| internal` |
+| `ws-message` | Typed WS frame: `text \| binary \| close(option<string>)` |
+
+`handle-websocket` / `handle-sse` return `tuple<stream<T>, future<result<_, plugin-error>>>` —
+the stream carries data, the future carries how the connection ended. Both are `async func`:
+a sync-lifted export has no callback to be re-entered on, so a producer spawned with
+`wit_bindgen::spawn_local` would never run and the stream would hang open delivering nothing.
 
 The `plugin-manifest.openapi` field is the single source of truth for routes **and** security.
 The host parses the OpenAPI JSON to derive `http_routes`, `ws_routes`, `sse_routes`, and
@@ -105,9 +133,15 @@ The host parses the OpenAPI JSON to derive `http_routes`, `ws_routes`, `sse_rout
 | `log(level, msg)` | Write structured log output via the host's tracing subscriber |
 | `get-user / list-users / create-user` | Typed access to the host's `users` table |
 | `get-payment / list-user-payments / create-payment` | Typed access to the host's `payments` table |
-| `ws-recv / ws-send` | Receive/send a message on the active WebSocket connection |
-| `sse-yield(data)` | Push a chunk on the active SSE stream |
 
+WS and SSE have no host-api functions: that traffic travels on the streams declared in
+`plugin-api` (see below), so there is no per-message boundary crossing.
+
+Functions are `async func` in the WIT exactly when the host implementation awaits
+(DB and typed-data calls). The rest are plain `func` — `emit-event` is a channel send,
+`cache-*` is in-process, `log` goes to tracing. Do **not** re-add a blanket `async: true`
+to the plugin bindgen: it async-lifts every export including the sync ones, and wasmtime 47
+rejects the resulting component at load time.
 ### Adding a new system event type
 
 1. Add a variant to `system-event` and a case to `system-event-kind` in `wit/plugin.wit`.
@@ -142,6 +176,10 @@ cargo build -p host
 > **Important:** always run `build-plugins.sh` before `cargo build -p host` after
 > any WIT change. The host's `bindgen!` and the plugins' `wit_bindgen::generate!`
 > both read the WIT at compile time.
+>
+> A component that compiles can still fail to *load*. `cargo build` passing proves
+> nothing about the ABI — check with a real run, or parse each artifact, before
+> assuming a WIT change worked.
 
 ### Run
 
@@ -225,13 +263,26 @@ Routes annotated with `security: [{"bearerAuth": []}]` in the OpenAPI spec requi
 1. Create `plugins/{name}/` following the structure of `plugins/bonus/`.
 2. Set `[package.metadata.component] target = { path = "../../wit" }` in `Cargo.toml`
    and `crate-type = ["cdylib"]`.
-3. In `src/lib.rs`, generate bindings with `wit_bindgen::generate!({ path: "./wit/plugin.wit" })`.
+3. In `src/lib.rs`, generate bindings with:
+   ```rust
+   wit_bindgen::generate!({
+       path: "./wit",            // directory, not the bare file, so wit/deps resolves
+       world: "plugin-guest",
+       generate_all,             // required once wit/deps exists
+   });
+   ```
    Do **not** pass `async: true` — that async-lifts every export, including the ones the WIT
    declares sync, and wasmtime 47 rejects such a component at load time with
    "the `async` canonical option requires an async function type". Asynchrony is declared in
    the WIT (`async func`) and the generator follows it.
-4. Implement the `Guest` trait methods: `manifest`, `init`, `handle_event`, `handle_http`
-   (and optionally `handle_websocket`, `handle_sse`).
+   `wit-bindgen` needs features `["async", "async-spawn"]` (`spawn_local` is not in `async`).
+4. Implement the `Guest` trait methods: `manifest`, `init`, `handle_event`, `handle_http`,
+   `handle_websocket`, `handle_sse` — all six are required. The two streaming ones return
+   `(StreamReader<T>, FutureReader<Result<(), PluginError>>)`; a plugin that does not use them
+   returns an already-dropped stream (see `plugins/bonus/src/lib.rs`). To actually stream,
+   build the pair with `wit_stream::new()` / `wit_future::new()`, return the readers
+   immediately, and produce from a `wit_bindgen::spawn_local` task. Batch writes —
+   one `write_all` is one boundary crossing regardless of how many items it carries.
 5. Build routes with `utoipa-axum`'s `OpenApiRouter` + `#[utoipa::path]` attributes.
    OpenAPI is the only route registry — the host derives routes and auth from it.
 6. To protect a route with JWT, add `security(("bearerAuth" = []))` to its `#[utoipa::path]`
@@ -240,14 +291,17 @@ Routes annotated with `security: [{"bearerAuth": []}]` in the OpenAPI spec requi
 8. Add DB migrations; embed them with `diesel_wasm_bridge::migration!()` in `migrations.rs`.
 9. Add DB operations in `repository.rs` using `diesel_wasm_bridge::render_query` + `db::execute/query`.
 10. Add the plugin name to `PLUGINS` in `.env`.
-11. Run `scripts/build-plugins.sh`.
+11. Run `scripts/build-plugins.sh` — it mirrors `wit/` into `plugins/{name}/wit/` before
+    building and warns if the copy had diverged. Never edit a plugin's copy; it is generated.
 
 ### Plugin module layout
 
 ```
 plugins/{name}/src/
   lib.rs          ← Guest impl: manifest(), init(), handle_event(), handle_http(),
-                    handle_websocket(), handle_sse()
+                    handle_websocket(), handle_sse()  — the last two return
+                    (stream, future) pairs; produce via wit_bindgen::spawn_local
+  wit/            ← generated copy of the root wit/ (incl. deps/); do not edit
   router.rs       ← utoipa-axum OpenApiRouter + openapi_json(); BearerAuth modifier if needed
   handlers.rs     ← HTTP handler functions with #[utoipa::path] attributes
   events.rs       ← subscribed_events() + event dispatch
@@ -270,6 +324,9 @@ plugins/{name}/src/
 - **Fuel** — HTTP and event stores get `10_000_000` fuel units per invocation; runaway
   computation traps. WS and SSE stores use `u64::MAX` (no per-call limit) because they are
   long-lived and would exhaust any fixed budget.
+- **Backpressure** — WS/SSE streams drain into bounded channels (`STREAM_BUFFER` batches in
+  `routes/plugins.rs`); when a client falls behind, the plugin's next stream write blocks
+  rather than the host buffering without limit.
 - **Authentication** — Route protection is declared entirely through the OpenAPI spec:
   add `security(("bearerAuth" = []))` to a `#[utoipa::path]` attribute and the host will
   enforce `Authorization: Bearer <JWT>` before the WASM boundary is crossed. This applies
@@ -280,14 +337,19 @@ plugins/{name}/src/
 ## Codebase map
 
 ```
-wit/plugin.wit                     ← authoritative WIT (one source of truth)
+wit/plugin.wit                     ← authoritative WIT (worlds: plugin, plugin-guest)
+wit/deps/clocks.wit                ← wasi:clocks@0.3.0, copied from wasmtime-wasi 47
 crates/
   host/src/
     main.rs                        ← startup: discover .wasm files, load plugins, serve
     runtime.rs                     ← PluginRuntime, PluginExecutor, LoadedPlugin, event loop
     api.rs                         ← Axum routes, OpenAPI annotations, users/payments CRUD
-    host_api.rs                    ← Host trait impl: db_query/execute, emit_event, cache, log,
-                                     get_user, list_users, create_user, get_payment, …
+    host_api.rs                    ← Host (sync funcs: emit_event, cache, log) and
+                                     HostWithStore (async funcs: db_query/execute, get_user,
+                                     create_payment, …) — async funcs take an Accessor,
+                                     not &mut self
+    streams.rs                     ← ChannelProducer / ChannelConsumer / OneshotConsumer:
+                                     tokio channels <-> component-model streams & futures
     db.rs                          ← DbPool, inline_binds, decode_bind
     migrations.rs                  ← Core (embedded) + plugin migration runner
     dispatcher.rs                  ← Broadcast-channel event bus, MAX_CHAIN_DEPTH guard
@@ -316,9 +378,10 @@ plugins/
     src/error.rs                   ← AppError + IntoResponse
     src/migrations.rs              ← Migration list via migration!()
     migrations/V####__name/        ← up.sql / down.sql
-    wit/plugin.wit                 ← Symlink/copy of root WIT (used by wit_bindgen)
+    wit/                           ← generated copy of root wit/ incl. deps/ (do not edit)
 scripts/
-  build-plugins.sh                 ← cargo build --release --target wasm32-wasip2 for each plugin
+  build-plugins.sh                 ← mirrors wit/ into each plugin, then
+                                     cargo build --release --target wasm32-wasip2
 ```
 
 ---
@@ -326,6 +389,13 @@ scripts/
 ## Known limitations / future work
 
 - `SharedCache` has no background eviction; entries accumulate until process restart.
+- `handle-http` still passes whole bodies as `option<list<u8>>` in both directions, so a large
+  upload is buffered in the host, copied across the boundary, and materialised again in the
+  guest. WS/SSE stream; HTTP does not yet.
+- `bonus`/`push` rebuild their `OpenApiRouter` on every request: the `LazyLock` in `router.rs`
+  never caches because each HTTP call gets a fresh instance. Measured ~75 us of a ~96 us call.
+  See the PERF NOTE in `plugins/bonus/src/router.rs` for the fix and why it was deferred.
+- No integration test loads the plugins. Every ABI change so far was verified by hand.
 - `SET LOCAL ROLE "plugin_{name}"` is commented out in `db.rs` (`execute_raw` and `query_raw`);
   Postgres row-level isolation is not enforced at runtime yet.
 - `query_raw` inlines bind parameters as SQL literals (text protocol). Diesel's `FromSql` impls

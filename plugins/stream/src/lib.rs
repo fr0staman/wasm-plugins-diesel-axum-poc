@@ -1,6 +1,9 @@
 mod bindings {
     wit_bindgen::generate!({
-        path: "./wit/plugin.wit",
+        // Directory, not the bare file, so `wit/deps` resolves.
+        path: "./wit",
+        world: "plugin-guest",
+        generate_all,
     });
 
     use super::Component;
@@ -12,6 +15,7 @@ mod migrations;
 mod router;
 
 use bindings::exports::myapp::plugin::plugin_api::Guest;
+use bindings::wasi::clocks::monotonic_clock;
 use bindings::{wit_future, wit_stream};
 use bindings::myapp::plugin::types::{
     EventEnvelope, HttpRequest, HttpResponse, PluginError, PluginManifest, WsMessage,
@@ -72,16 +76,19 @@ impl Guest for Component {
         wit_bindgen::StreamReader<Vec<u8>>,
         wit_bindgen::FutureReader<Result<(), PluginError>>,
     ) {
-        // path is e.g. "/generate?count=10"
-        let count: u32 = path
-            .split_once('?')
-            .and_then(|(_, qs)| {
+        // path is e.g. "/generate?count=10&interval_ms=100"
+        let param = |key: &str| -> Option<u64> {
+            path.split_once('?').and_then(|(_, qs)| {
                 qs.split('&')
-                    .find_map(|kv| kv.strip_prefix("count="))
+                    .find_map(|kv| kv.strip_prefix(key))
                     .and_then(|v| v.parse().ok())
             })
-            .unwrap_or(5)
-            .min(100);
+        };
+        let count = param("count=").unwrap_or(5).min(100) as u32;
+        // Spacing between chunks. Needs a real clock inside the plugin, which
+        // is what wasi:clocks@0.3 provides — under 0.2 a guest had no way to
+        // sleep at all.
+        let interval_ms = param("interval_ms=").unwrap_or(0).min(10_000);
 
         let (mut chunks_tx, chunks_rx) = wit_stream::new::<Vec<u8>>();
         let (done_tx, done_rx) = wit_future::new::<Result<(), PluginError>>(|| {
@@ -92,9 +99,21 @@ impl Guest for Component {
             // Batch writes: one `write_all` is one boundary crossing regardless
             // of how many items it carries, so filling the batch amortises the
             // per-crossing cost across chunks.
+            //
+            // Batching is skipped when an interval is requested: there the
+            // point is that each chunk reaches the client on schedule, and
+            // holding one back to fill a batch would defeat that.
             let mut batch = Vec::with_capacity(SSE_BATCH);
             for i in 0..count {
-                batch.push(format!(r#"{{"index":{},"data":"item_{}"}}"#, i, i).into_bytes());
+                let chunk = format!(r#"{{"index":{},"data":"item_{}"}}"#, i, i).into_bytes();
+
+                if interval_ms > 0 {
+                    chunks_tx.write_all(vec![chunk]).await;
+                    monotonic_clock::wait_for(interval_ms * 1_000_000).await;
+                    continue;
+                }
+
+                batch.push(chunk);
                 if batch.len() == SSE_BATCH {
                     chunks_tx.write_all(core::mem::take(&mut batch)).await;
                     batch.reserve(SSE_BATCH);

@@ -1,6 +1,9 @@
 mod bindings {
     wit_bindgen::generate!({
-        path: "./wit/plugin.wit",
+        // Directory, not the bare file, so `wit/deps` resolves.
+        path: "./wit",
+        world: "plugin-guest",
+        generate_all,
     });
 
     use super::Component;
