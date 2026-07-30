@@ -29,5 +29,8 @@ matchit  = "0.8"
 dotenvy  = "0.15.7"
 futures-util = { workspace = true }
 async-stream  = "0.3"
-jsonwebtoken  = "11"
+# v11 requires exactly one crypto provider feature, otherwise every sign/verify
+# panics at runtime ("Could not automatically determine the process-level
+# CryptoProvider"). rust_crypto keeps the build pure Rust; aws_lc_rs pulls C.
+jsonwebtoken  = { version = "11", features = ["rust_crypto"] }
 utoipa-axum = "0.2.0"
