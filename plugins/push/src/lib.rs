@@ -1,7 +1,6 @@
 mod bindings {
     wit_bindgen::generate!({
         path: "./wit/plugin.wit",
-        async: true
     });
 
     use super::Component;
@@ -27,7 +26,7 @@ use bindings::myapp::plugin::types::{
 struct Component;
 
 impl Guest for Component {
-    async fn manifest() -> PluginManifest {
+    fn manifest() -> PluginManifest {
         PluginManifest {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

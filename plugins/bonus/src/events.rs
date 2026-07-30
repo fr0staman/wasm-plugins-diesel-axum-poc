@@ -11,12 +11,11 @@ pub async fn dispatch(evt: EventEnvelope) -> Result<(), PluginError> {
     {
         host_api::log(
             LogLevel::Info,
-            format!(
+            &format!(
                 "would send bonus to user={} \"You earned {} cents bonus\"",
                 user.id, payment.amount_cents
             ),
-        )
-        .await;
+        );
     }
     Ok(())
 }

@@ -166,10 +166,14 @@ impl PluginExecutor {
     ) -> anyhow::Result<()> {
         let mut store = self.make_store_ws(plugin_name, ws);
         let instance = pre.instantiate_async(&mut store).await?;
-        instance
-            .myapp_plugin_plugin_api()
-            .call_handle_websocket(&mut store, &path, conn_id)
-            .await?
+        store
+            .run_concurrent(async move |accessor| {
+                instance
+                    .myapp_plugin_plugin_api()
+                    .call_handle_websocket(accessor, path, conn_id)
+                    .await
+            })
+            .await??
             .map_err(|e| anyhow::anyhow!("ws plugin error: {:?}", e))
     }
 
@@ -183,10 +187,14 @@ impl PluginExecutor {
     ) -> anyhow::Result<()> {
         let mut store = self.make_store_sse(plugin_name, sse);
         let instance = pre.instantiate_async(&mut store).await?;
-        instance
-            .myapp_plugin_plugin_api()
-            .call_handle_sse(&mut store, &path, conn_id)
-            .await?
+        store
+            .run_concurrent(async move |accessor| {
+                instance
+                    .myapp_plugin_plugin_api()
+                    .call_handle_sse(accessor, path, conn_id)
+                    .await
+            })
+            .await??
             .map_err(|e| anyhow::anyhow!("sse plugin error: {:?}", e))
     }
 
@@ -199,10 +207,14 @@ impl PluginExecutor {
         let mut store = self.make_store(plugin_name, 0);
         let instance = pre.instantiate_async(&mut store).await?;
 
-        instance
-            .myapp_plugin_plugin_api()
-            .call_handle_http(&mut store, &req)
-            .await?
+        store
+            .run_concurrent(async move |accessor| {
+                instance
+                    .myapp_plugin_plugin_api()
+                    .call_handle_http(accessor, req)
+                    .await
+            })
+            .await??
             .map_err(|e| anyhow!("plugin error: {:?}", e))
     }
 
@@ -221,11 +233,19 @@ impl PluginExecutor {
         let mut store = self.make_store(plugin_name, envelope.chain_depth);
         match pre.instantiate_async(&mut store).await {
             Ok(instance) => {
-                let guest = instance.myapp_plugin_plugin_api();
-                match guest.call_handle_event(&mut store, envelope).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!(error = ?e, "plugin returned error"),
-                    Err(e) => tracing::error!(error = %e, "plugin trap"),
+                let envelope = envelope.clone();
+                let result = store
+                    .run_concurrent(async move |accessor| {
+                        instance
+                            .myapp_plugin_plugin_api()
+                            .call_handle_event(accessor, envelope)
+                            .await
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => tracing::error!(error = ?e, "plugin returned error"),
+                    Ok(Err(e)) | Err(e) => tracing::error!(error = %e, "plugin trap"),
                 }
             }
             Err(e) => tracing::error!(error = %e, "failed to instantiate plugin"),
@@ -263,13 +283,25 @@ impl PluginRuntime {
         pool.total_memories(64);
         pool.total_tables(64);
         pool.max_memories_per_component(1);
+        // Instantiation is the dominant per-request cost, so bias the pool for
+        // slot reuse over RSS: prefer affine (same-module) slots, and reset
+        // small regions with memset instead of madvise so a reused slot does
+        // not fault its pages back in.
+        pool.max_unused_warm_slots(0);
+        pool.linear_memory_keep_resident(2 << 20);
+        pool.table_keep_resident(64 << 10);
 
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 
         let engine = Engine::new(&config)?;
 
         let mut linker = Linker::new(&engine);
+        // Both are needed. Guests are built for wasm32-wasip2, so their std pulls
+        // wasi:*@0.2.x; p3 covers any interface a plugin imports at 0.3.0 directly.
+        // Dropping the p2 line makes every plugin fail to link with
+        // "component imports instance `wasi:io/poll@0.2.x`".
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
 
         let db = match DbPool::new(database_url).await {
@@ -336,8 +368,11 @@ impl PluginRuntime {
         // Single instantiation reads all metadata via manifest(); http routes are derived from the openapi field.
         let mut store = self.executor.make_store("__loading__", 0);
         let instance = plugin_pre.instantiate_async(&mut store).await?;
-        let guest = instance.myapp_plugin_plugin_api();
-        let manifest = guest.call_manifest(&mut store).await?;
+        let manifest = store
+            .run_concurrent(async move |accessor| {
+                instance.myapp_plugin_plugin_api().call_manifest(accessor).await
+            })
+            .await??;
 
         let parsed = routes_from_openapi(&manifest.openapi);
 

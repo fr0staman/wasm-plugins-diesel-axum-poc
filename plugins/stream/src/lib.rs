@@ -1,7 +1,6 @@
 mod bindings {
     wit_bindgen::generate!({
         path: "./wit/plugin.wit",
-        async: true,
     });
 
     use super::Component;
@@ -21,7 +20,7 @@ use bindings::myapp::plugin::types::{
 struct Component;
 
 impl Guest for Component {
-    async fn manifest() -> PluginManifest {
+    fn manifest() -> PluginManifest {
         PluginManifest {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -61,8 +60,7 @@ impl Guest for Component {
 
         for i in 0..count {
             let chunk = format!(r#"{{"index":{},"data":"item_{}"}}"#, i, i);
-            host_api::sse_yield(chunk.into_bytes())
-                .await
+            host_api::sse_yield(chunk.as_bytes())
                 .map_err(|e| PluginError::Internal(format!("{e:?}")))?;
         }
         Ok(())

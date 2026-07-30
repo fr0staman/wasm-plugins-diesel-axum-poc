@@ -11,40 +11,43 @@ version = "0.1.0"
 
 [workspace.dependencies]
 # Wasmtime
-wasmtime         = { version = "44.0.1", features = ["component-model-async", "parallel-compilation"] }
-wasmtime-wasi    = { version = "44.0.1", default-features = false, features = ["p2"] }
+wasmtime         = { version = "47.0.2", features = ["component-model-async", "parallel-compilation"] }
+# "p2" is required, not implied by "p3": guests still get their WASI imports from
+# the wasm32-wasip2 target (wasi:*@0.2.12). Without it the p2 module still compiles
+# but its interfaces are never registered, and every plugin fails to instantiate.
+wasmtime-wasi    = { version = "47.0.2", default-features = false, features = ["p2", "p3"] }
 
 # Diesel / DB
 diesel           = { version = "2.3.9", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-diesel-async     = { version = "0.9.0", features = ["deadpool", "postgres"] }
+diesel-async     = { version = "0.9.2", features = ["deadpool", "postgres"] }
 
 
 # SQL validation
 sqlparser         = { version = "0.62.0", features = ["visitor"] }
-futures-util      = { version = "0.3.31", default-features = false }
+futures-util      = { version = "0.3.33", default-features = false }
 
 # Async runtime
-tokio            = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio            = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
 # Tracing
-tracing          = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing          = { version = "0.1.44" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # HTTP server
-axum             = { version = "0.8", features = ["ws"] }
+axum             = { version = "0.8.9", features = ["ws"] }
 
 # OpenAPI
 utoipa           = { version = "5.5.0", features = ["axum_extras", "chrono"] }
 
 # Serialization
-serde            = { version = "1", features = ["derive"] }
-serde_json       = { version = "1" }
+serde            = { version = "1.0.229", features = ["derive"] }
+serde_json       = { version = "1.0.151" }
 
 # Misc
-anyhow           = { version = "1.0.98" }
-dashmap          = { version = "6.1.0" }
+anyhow           = { version = "1.0.104" }
+dashmap          = { version = "6.2.1" }
 
-config           = { version = "0.15.22", default-features = false }
+config           = { version = "0.15.25", default-features = false }
 
 [profile.release]
 lto = "thin"

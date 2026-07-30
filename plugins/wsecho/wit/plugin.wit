@@ -124,10 +124,15 @@ interface host-api {
     use types.{rendered-query, plugin-error, event-payload, log-level,
                user-snapshot, user-tier, payment-snapshot, ws-message};
 
-    db-query: func(q: rendered-query)
+    /// Asynchrony is declared here, in the contract — not in bindgen options.
+    /// A function is `async func` when the host implementation genuinely awaits
+    /// (I/O, channels); everything else stays sync so the guest is not forced to
+    /// suspend for an in-process call.
+    db-query: async func(q: rendered-query)
         -> result<list<list<list<u8>>>, plugin-error>;
-    db-execute: func(q: rendered-query) -> result<u64, plugin-error>;
+    db-execute: async func(q: rendered-query) -> result<u64, plugin-error>;
 
+    /// Non-blocking: pushes onto the dispatcher's broadcast channel.
     emit-event: func(payload: event-payload) -> result<_, plugin-error>;
 
     cache-get: func(key: string) -> option<list<u8>>;
@@ -136,30 +141,33 @@ interface host-api {
     log: func(level: log-level, msg: string);
 
     /// Look up a single user by primary key.
-    get-user: func(user-id: u64) -> result<user-snapshot, plugin-error>;
+    get-user: async func(user-id: u64) -> result<user-snapshot, plugin-error>;
     /// List all users belonging to a tenant.
-    list-users: func(tenant-id: u64) -> result<list<user-snapshot>, plugin-error>;
+    list-users: async func(tenant-id: u64) -> result<list<user-snapshot>, plugin-error>;
     /// Create a new user; returns the persisted snapshot.
-    create-user: func(tenant-id: u64, email: string, locale: string, tier: user-tier)
+    create-user: async func(tenant-id: u64, email: string, locale: string, tier: user-tier)
         -> result<user-snapshot, plugin-error>;
 
     /// Look up a single payment by primary key.
-    get-payment: func(payment-id: u64) -> result<payment-snapshot, plugin-error>;
+    get-payment: async func(payment-id: u64) -> result<payment-snapshot, plugin-error>;
     /// List all payments for a user.
-    list-user-payments: func(user-id: u64) -> result<list<payment-snapshot>, plugin-error>;
+    list-user-payments: async func(user-id: u64) -> result<list<payment-snapshot>, plugin-error>;
     /// Record a new payment; returns the persisted snapshot.
-    create-payment: func(user-id: u64, amount-cents: s64, currency: string, method: string)
+    create-payment: async func(user-id: u64, amount-cents: s64, currency: string, method: string)
         -> result<payment-snapshot, plugin-error>;
 
     /// Receive the next typed WebSocket message.
     /// Returns none when the client closed the connection.
-    ws-recv: func() -> option<ws-message>;
+    /// Blocks for an unbounded time, so it is async in the contract.
+    ws-recv: async func() -> option<ws-message>;
 
     /// Send a typed WebSocket message to the connected client.
+    /// Non-blocking: hands the frame to the connection's outbound channel.
     ws-send: func(msg: ws-message) -> result<_, plugin-error>;
 
     /// Push one SSE data chunk to the connected client.
     /// Each call emits a single data: line; the stream closes when handle-sse returns.
+    /// Non-blocking, like ws-send.
     sse-yield: func(data: list<u8>) -> result<_, plugin-error>;
 }
 
@@ -168,19 +176,20 @@ interface plugin-api {
 
     /// Return all static metadata in one call. HTTP routes are derived by the host from
     /// the openapi field; no separate http-routes list is needed.
+    /// Pure metadata assembly — stays sync.
     manifest: func() -> plugin-manifest;
 
-    init: func() -> result<_, plugin-error>;
-    handle-event: func(evt: event-envelope) -> result<_, plugin-error>;
-    handle-http: func(req: http-request) -> result<http-response, plugin-error>;
+    init: async func() -> result<_, plugin-error>;
+    handle-event: async func(evt: event-envelope) -> result<_, plugin-error>;
+    handle-http: async func(req: http-request) -> result<http-response, plugin-error>;
 
     /// Called once per WebSocket connection. Runs for the lifetime of the connection:
     /// loop on ws-recv until none, call ws-send to reply. The CM async machinery
     /// properly suspends the plugin fiber while awaiting each ws-recv.
-    handle-websocket: func(path: string, conn-id: u64) -> result<_, plugin-error>;
+    handle-websocket: async func(path: string, conn-id: u64) -> result<_, plugin-error>;
 
     /// Called once per SSE connection. Push chunks by calling sse-yield; returning Ok(()) closes the stream.
-    handle-sse: func(path: string, conn-id: u64) -> result<_, plugin-error>;
+    handle-sse: async func(path: string, conn-id: u64) -> result<_, plugin-error>;
 }
 
 world plugin {

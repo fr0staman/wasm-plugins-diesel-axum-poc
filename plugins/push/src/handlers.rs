@@ -49,7 +49,7 @@ pub async fn post_send(
             "a push notification was already sent to this user today".to_string(),
         )),
         _ => {
-            host_api::log(LogLevel::Info, format!("push queued for user={uid}")).await;
+            host_api::log(LogLevel::Info, &format!("push queued for user={uid}"));
             Ok((
                 StatusCode::ACCEPTED,
                 Json(SendResponse {

@@ -1,4 +1,4 @@
-use crate::bindings::myapp::plugin::host_api::Host;
+use crate::bindings::myapp::plugin::host_api::{Host, HostWithStore};
 use crate::bindings::myapp::plugin::types::Host as TypesHost;
 use crate::bindings::myapp::plugin::types::{
     EventPayload, LogLevel, PaymentSnapshot, PluginError, RenderedQuery, UserSnapshot, UserTier,
@@ -10,7 +10,7 @@ use crate::dispatcher::Dispatcher;
 use crate::validation::{ValidationCache, validate_table_access_cached};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use wasmtime::component::ResourceTable;
+use wasmtime::component::{Accessor, HasSelf, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 /// Channels that bridge an active WebSocket connection to a plugin store.
@@ -59,39 +59,170 @@ impl WasiView for PluginState {
     }
 }
 
+/// Snapshot of the store state needed to run a DB call without holding a borrow
+/// across an await. `Accessor::with` gives synchronous access only, so every
+/// `HostWithStore` method pulls what it needs out first, then awaits freely.
+struct DbCtx {
+    db: Option<Arc<DbPool>>,
+    plugin_name: String,
+    validation_cache: ValidationCache,
+}
+
+fn db_ctx<U>(store: &Accessor<U, HasSelf<PluginState>>) -> DbCtx {
+    store.with(|mut view| {
+        let s = view.get();
+        DbCtx {
+            db: s.db.clone(),
+            plugin_name: s.plugin_name.clone(),
+            validation_cache: s.validation_cache.clone(),
+        }
+    })
+}
+
+fn require_db(ctx: &DbCtx) -> Result<&Arc<DbPool>, PluginError> {
+    ctx.db
+        .as_ref()
+        .ok_or_else(|| PluginError::Internal("no db pool".into()))
+}
+
+// ── `async func` imports ──────────────────────────────────────────────────────
+// Declared `async func` in the WIT, so bindgen puts them on `HostWithStore`
+// as associated functions over an `Accessor` rather than `&mut self` methods.
+impl<U> HostWithStore<U> for HasSelf<PluginState> {
+    async fn db_query(
+        store: &Accessor<U, Self>,
+        q: RenderedQuery,
+    ) -> Result<Vec<Vec<Vec<u8>>>, PluginError> {
+        let ctx = db_ctx(store);
+        if let Err(e) =
+            validate_table_access_cached(&ctx.validation_cache, &q.sql, &ctx.plugin_name)
+        {
+            return Err(PluginError::InvalidInput(e.to_string()));
+        }
+
+        require_db(&ctx)?
+            .query_raw(&q.sql, &ctx.plugin_name, q.binds, q.bind_types)
+            .await
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    async fn db_execute(store: &Accessor<U, Self>, q: RenderedQuery) -> Result<u64, PluginError> {
+        let ctx = db_ctx(store);
+        if let Err(e) =
+            validate_table_access_cached(&ctx.validation_cache, &q.sql, &ctx.plugin_name)
+        {
+            return Err(PluginError::InvalidInput(e.to_string()));
+        }
+
+        require_db(&ctx)?
+            .execute_raw(&q.sql, &ctx.plugin_name, q.binds, q.bind_types)
+            .await
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    async fn get_user(
+        store: &Accessor<U, Self>,
+        user_id: u64,
+    ) -> Result<UserSnapshot, PluginError> {
+        let ctx = db_ctx(store);
+        crate::repository::find_user(require_db(&ctx)?, user_id as i64)
+            .await
+            .map_err(|e| PluginError::DbError(e.to_string()))?
+            .map(user_to_snapshot)
+            .ok_or(PluginError::NotFound)
+    }
+
+    async fn list_users(
+        store: &Accessor<U, Self>,
+        tenant_id: u64,
+    ) -> Result<Vec<UserSnapshot>, PluginError> {
+        let ctx = db_ctx(store);
+        crate::repository::list_users(require_db(&ctx)?, tenant_id as i64)
+            .await
+            .map(|v| v.into_iter().map(user_to_snapshot).collect())
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    async fn create_user(
+        store: &Accessor<U, Self>,
+        tenant_id: u64,
+        email: String,
+        locale: String,
+        tier: UserTier,
+    ) -> Result<UserSnapshot, PluginError> {
+        let ctx = db_ctx(store);
+        let new = crate::models::NewUser {
+            tenant_id: tenant_id as i64,
+            email: &email,
+            locale: &locale,
+            tier: tier_to_str(tier),
+        };
+        crate::repository::create_user(require_db(&ctx)?, new)
+            .await
+            .map(user_to_snapshot)
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    async fn get_payment(
+        store: &Accessor<U, Self>,
+        payment_id: u64,
+    ) -> Result<PaymentSnapshot, PluginError> {
+        let ctx = db_ctx(store);
+        crate::repository::find_payment(require_db(&ctx)?, payment_id as i64)
+            .await
+            .map_err(|e| PluginError::DbError(e.to_string()))?
+            .map(payment_to_snapshot)
+            .ok_or(PluginError::NotFound)
+    }
+
+    async fn list_user_payments(
+        store: &Accessor<U, Self>,
+        user_id: u64,
+    ) -> Result<Vec<PaymentSnapshot>, PluginError> {
+        let ctx = db_ctx(store);
+        crate::repository::list_user_payments(require_db(&ctx)?, user_id as i64)
+            .await
+            .map(|v| v.into_iter().map(payment_to_snapshot).collect())
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    async fn create_payment(
+        store: &Accessor<U, Self>,
+        user_id: u64,
+        amount_cents: i64,
+        currency: String,
+        method: String,
+    ) -> Result<PaymentSnapshot, PluginError> {
+        let ctx = db_ctx(store);
+        let new = crate::models::NewPayment {
+            user_id: user_id as i64,
+            amount_cents,
+            currency: &currency,
+            method: &method,
+        };
+        crate::repository::create_payment(require_db(&ctx)?, new)
+            .await
+            .map(payment_to_snapshot)
+            .map_err(|e| PluginError::DbError(e.to_string()))
+    }
+
+    /// Takes the connection out of the store for the duration of the await, then
+    /// puts it back — an `Accessor` borrow cannot be held across a suspension.
+    /// A second concurrent `ws-recv` on the same store therefore sees no
+    /// connection and reports the stream as closed; the guest is expected to
+    /// receive sequentially, as the loop in `plugins/wsecho` does.
+    async fn ws_recv(store: &Accessor<U, Self>) -> Option<WsMessage> {
+        let mut ws = store.with(|mut view| view.get().ws.take())?;
+        let msg = ws.inbound.recv().await;
+        store.with(|mut view| view.get().ws = Some(ws));
+        msg
+    }
+}
+
+// ── plain `func` imports ──────────────────────────────────────────────────────
+// Not declared async in the WIT: the host completes them without awaiting, so
+// they stay `&mut self` methods on `Host`.
 impl Host for PluginState {
-    async fn db_query(&mut self, q: RenderedQuery) -> Result<Vec<Vec<Vec<u8>>>, PluginError> {
-        if let Err(e) =
-            validate_table_access_cached(&self.validation_cache, &q.sql, &self.plugin_name)
-        {
-            return Err(PluginError::InvalidInput(e.to_string()));
-        }
-
-        let Some(db) = &self.db else {
-            return Err(PluginError::Internal("no db pool".into()));
-        };
-
-        db.query_raw(&q.sql, &self.plugin_name, q.binds, q.bind_types)
-            .await
-            .map_err(|e| PluginError::DbError(e.to_string()))
-    }
-
-    async fn db_execute(&mut self, q: RenderedQuery) -> Result<u64, PluginError> {
-        if let Err(e) =
-            validate_table_access_cached(&self.validation_cache, &q.sql, &self.plugin_name)
-        {
-            return Err(PluginError::InvalidInput(e.to_string()));
-        }
-
-        let Some(db) = &self.db else {
-            return Err(PluginError::Internal("no db pool".into()));
-        };
-
-        db.execute_raw(&q.sql, &self.plugin_name, q.binds, q.bind_types)
-            .await
-            .map_err(|e| PluginError::DbError(e.to_string()))
-    }
-
     async fn emit_event(&mut self, payload: EventPayload) -> Result<(), PluginError> {
         use crate::bindings::myapp::plugin::types::{EventEnvelope, EventSource};
 
@@ -123,82 +254,6 @@ impl Host for PluginState {
         }
     }
 
-    async fn get_user(&mut self, user_id: u64) -> Result<UserSnapshot, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        crate::repository::find_user(db, user_id as i64)
-            .await
-            .map_err(|e| PluginError::DbError(e.to_string()))?
-            .map(user_to_snapshot)
-            .ok_or(PluginError::NotFound)
-    }
-
-    async fn list_users(&mut self, tenant_id: u64) -> Result<Vec<UserSnapshot>, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        crate::repository::list_users(db, tenant_id as i64)
-            .await
-            .map(|v| v.into_iter().map(user_to_snapshot).collect())
-            .map_err(|e| PluginError::DbError(e.to_string()))
-    }
-
-    async fn create_user(
-        &mut self,
-        tenant_id: u64,
-        email: String,
-        locale: String,
-        tier: UserTier,
-    ) -> Result<UserSnapshot, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        let new = crate::models::NewUser {
-            tenant_id: tenant_id as i64,
-            email: &email,
-            locale: &locale,
-            tier: tier_to_str(tier),
-        };
-        crate::repository::create_user(db, new)
-            .await
-            .map(user_to_snapshot)
-            .map_err(|e| PluginError::DbError(e.to_string()))
-    }
-
-    async fn get_payment(&mut self, payment_id: u64) -> Result<PaymentSnapshot, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        crate::repository::find_payment(db, payment_id as i64)
-            .await
-            .map_err(|e| PluginError::DbError(e.to_string()))?
-            .map(payment_to_snapshot)
-            .ok_or(PluginError::NotFound)
-    }
-
-    async fn list_user_payments(
-        &mut self,
-        user_id: u64,
-    ) -> Result<Vec<PaymentSnapshot>, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        crate::repository::list_user_payments(db, user_id as i64)
-            .await
-            .map(|v| v.into_iter().map(payment_to_snapshot).collect())
-            .map_err(|e| PluginError::DbError(e.to_string()))
-    }
-
-    async fn ws_recv(&mut self) -> Option<WsMessage> {
-        self.ws.as_mut()?.inbound.recv().await
-    }
-
     async fn ws_send(&mut self, msg: WsMessage) -> Result<(), PluginError> {
         use axum::extract::ws::Message as AxumMsg;
         let axum_msg = match msg {
@@ -226,29 +281,6 @@ impl Host for PluginState {
             .outbound
             .send(axum::body::Bytes::from(data))
             .map_err(|_| PluginError::Internal("sse stream closed".into()))
-    }
-
-    async fn create_payment(
-        &mut self,
-        user_id: u64,
-        amount_cents: i64,
-        currency: String,
-        method: String,
-    ) -> Result<PaymentSnapshot, PluginError> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| PluginError::Internal("no db".into()))?;
-        let new = crate::models::NewPayment {
-            user_id: user_id as i64,
-            amount_cents,
-            currency: &currency,
-            method: &method,
-        };
-        crate::repository::create_payment(db, new)
-            .await
-            .map(payment_to_snapshot)
-            .map_err(|e| PluginError::DbError(e.to_string()))
     }
 }
 

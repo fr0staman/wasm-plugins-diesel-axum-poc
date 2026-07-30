@@ -225,7 +225,11 @@ Routes annotated with `security: [{"bearerAuth": []}]` in the OpenAPI spec requi
 1. Create `plugins/{name}/` following the structure of `plugins/bonus/`.
 2. Set `[package.metadata.component] target = { path = "../../wit" }` in `Cargo.toml`
    and `crate-type = ["cdylib"]`.
-3. In `src/lib.rs`, generate bindings with `wit_bindgen::generate!({ path: "./wit/plugin.wit", async: true })`.
+3. In `src/lib.rs`, generate bindings with `wit_bindgen::generate!({ path: "./wit/plugin.wit" })`.
+   Do **not** pass `async: true` — that async-lifts every export, including the ones the WIT
+   declares sync, and wasmtime 47 rejects such a component at load time with
+   "the `async` canonical option requires an async function type". Asynchrony is declared in
+   the WIT (`async func`) and the generator follows it.
 4. Implement the `Guest` trait methods: `manifest`, `init`, `handle_event`, `handle_http`
    (and optionally `handle_websocket`, `handle_sse`).
 5. Build routes with `utoipa-axum`'s `OpenApiRouter` + `#[utoipa::path]` attributes.

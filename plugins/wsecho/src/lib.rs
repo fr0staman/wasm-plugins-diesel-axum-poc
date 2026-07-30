@@ -1,7 +1,6 @@
 mod bindings {
     wit_bindgen::generate!({
         path: "./wit/plugin.wit",
-        async: true,
     });
 
     use super::Component;
@@ -21,7 +20,7 @@ use bindings::myapp::plugin::types::{
 struct Component;
 
 impl Guest for Component {
-    async fn manifest() -> PluginManifest {
+    fn manifest() -> PluginManifest {
         PluginManifest {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -46,9 +45,8 @@ impl Guest for Component {
     async fn handle_websocket(path: String, conn_id: u64) -> Result<(), PluginError> {
         host_api::log(
             LogLevel::Info,
-            format!("ws connected: path={path} conn={conn_id}"),
-        )
-        .await;
+            &format!("ws connected: path={path} conn={conn_id}"),
+        );
 
         while let Some(msg) = host_api::ws_recv().await {
             let reply = match msg {
@@ -57,16 +55,17 @@ impl Guest for Component {
                     WsMessage::Binary(String::from_utf8_lossy(&b).to_uppercase().into_bytes())
                 }
                 WsMessage::Close(r) => {
-                    host_api::ws_send(WsMessage::Close(r)).await.ok();
+                    host_api::ws_send(&WsMessage::Close(r)).ok();
                     break;
                 }
             };
-            host_api::ws_send(reply)
-                .await
-                .map_err(|e| PluginError::Internal(format!("{e:?}")))?;
+            host_api::ws_send(&reply).map_err(|e| PluginError::Internal(format!("{e:?}")))?;
         }
 
-        host_api::log(LogLevel::Info, format!("ws disconnected: conn={conn_id}")).await;
+        host_api::log(
+            LogLevel::Info,
+            &format!("ws disconnected: conn={conn_id}"),
+        );
         Ok(())
     }
 

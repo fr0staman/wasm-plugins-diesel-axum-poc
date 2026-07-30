@@ -18,7 +18,7 @@ build_plugin() {
 
     (
         cd "$dir"
-        cargo build --release --target wasm32-wasip2 2>&1
+        cargo +nightly build --release --target wasm32-wasip2 2>&1
     )
 
     local wasm_path="$dir/target/wasm32-wasip2/release/${name}.wasm"
