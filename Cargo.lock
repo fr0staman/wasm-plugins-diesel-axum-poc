@@ -1107,6 +1107,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "utoipa",

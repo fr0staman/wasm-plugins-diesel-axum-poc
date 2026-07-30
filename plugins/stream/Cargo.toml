@@ -13,7 +13,7 @@ package = "myapp:stream"
 target = { path = "../../wit" }
 
 [dependencies]
-wit-bindgen = { version = "0.60.0", features = ["async"] }
+wit-bindgen = { version = "0.60.0", features = ["async", "async-spawn"] }
 axum        = { version = "0.8.9", default-features = false }
 utoipa      = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-axum = "0.2.0"

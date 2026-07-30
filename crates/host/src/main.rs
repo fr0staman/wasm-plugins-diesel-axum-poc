@@ -12,6 +12,7 @@ mod repository;
 mod routes;
 mod runtime;
 mod schema;
+mod streams;
 mod types;
 mod util;
 mod validation;

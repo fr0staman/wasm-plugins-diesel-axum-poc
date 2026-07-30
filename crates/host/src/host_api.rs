@@ -2,29 +2,14 @@ use crate::bindings::myapp::plugin::host_api::{Host, HostWithStore};
 use crate::bindings::myapp::plugin::types::Host as TypesHost;
 use crate::bindings::myapp::plugin::types::{
     EventPayload, LogLevel, PaymentSnapshot, PluginError, RenderedQuery, UserSnapshot, UserTier,
-    WsMessage,
 };
 use crate::context::SharedCache;
 use crate::db::DbPool;
 use crate::dispatcher::Dispatcher;
 use crate::validation::{ValidationCache, validate_table_access_cached};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use wasmtime::component::{Accessor, HasSelf, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-
-/// Channels that bridge an active WebSocket connection to a plugin store.
-/// Created by the Axum WebSocket handler and moved into PluginState.
-pub struct WsInFlight {
-    pub inbound: mpsc::Receiver<WsMessage>,
-    pub outbound: mpsc::UnboundedSender<axum::extract::ws::Message>,
-}
-
-/// Channel that bridges an active SSE connection to a plugin store.
-/// The plugin pushes chunks via sse_yield; the host forwards them as data: lines.
-pub struct SseInFlight {
-    pub outbound: mpsc::UnboundedSender<axum::body::Bytes>,
-}
 
 pub struct PluginState {
     pub wasi: WasiCtx,
@@ -37,10 +22,6 @@ pub struct PluginState {
     /// Chain depth of the event currently being handled; 0 for HTTP/WS/SSE invocations.
     /// Used by `emit_event` to set the outgoing envelope's `chain_depth`.
     pub current_chain_depth: u8,
-    /// Present only during a `handle_websocket` invocation.
-    pub ws: Option<WsInFlight>,
-    /// Present only during a `handle_sse` invocation.
-    pub sse: Option<SseInFlight>,
 }
 
 pub fn new_conn_id() -> u64 {
@@ -206,17 +187,6 @@ impl<U> HostWithStore<U> for HasSelf<PluginState> {
             .map_err(|e| PluginError::DbError(e.to_string()))
     }
 
-    /// Takes the connection out of the store for the duration of the await, then
-    /// puts it back — an `Accessor` borrow cannot be held across a suspension.
-    /// A second concurrent `ws-recv` on the same store therefore sees no
-    /// connection and reports the stream as closed; the guest is expected to
-    /// receive sequentially, as the loop in `plugins/wsecho` does.
-    async fn ws_recv(store: &Accessor<U, Self>) -> Option<WsMessage> {
-        let mut ws = store.with(|mut view| view.get().ws.take())?;
-        let msg = ws.inbound.recv().await;
-        store.with(|mut view| view.get().ws = Some(ws));
-        msg
-    }
 }
 
 // ── plain `func` imports ──────────────────────────────────────────────────────
@@ -254,34 +224,6 @@ impl Host for PluginState {
         }
     }
 
-    async fn ws_send(&mut self, msg: WsMessage) -> Result<(), PluginError> {
-        use axum::extract::ws::Message as AxumMsg;
-        let axum_msg = match msg {
-            WsMessage::Text(t) => AxumMsg::Text(t.into()),
-            WsMessage::Binary(b) => AxumMsg::Binary(b.into()),
-            WsMessage::Close(reason) => {
-                AxumMsg::Close(reason.map(|r| axum::extract::ws::CloseFrame {
-                    code: 1000,
-                    reason: r.into(),
-                }))
-            }
-        };
-        self.ws
-            .as_ref()
-            .ok_or_else(|| PluginError::Internal("not in a ws context".into()))?
-            .outbound
-            .send(axum_msg)
-            .map_err(|_| PluginError::Internal("ws closed".into()))
-    }
-
-    async fn sse_yield(&mut self, data: Vec<u8>) -> Result<(), PluginError> {
-        self.sse
-            .as_ref()
-            .ok_or_else(|| PluginError::Internal("not in an sse context".into()))?
-            .outbound
-            .send(axum::body::Bytes::from(data))
-            .map_err(|_| PluginError::Internal("sse stream closed".into()))
-    }
 }
 
 fn user_to_snapshot(u: crate::models::User) -> UserSnapshot {

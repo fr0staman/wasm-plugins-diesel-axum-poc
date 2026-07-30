@@ -16,6 +16,7 @@ diesel_migrations = "2"
 chrono           = "0.4"
 sqlparser        = { workspace = true }
 tokio            = { workspace = true }
+tokio-util       = { version = "0.7.19", default-features = false }
 tracing          = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum             = { workspace = true }

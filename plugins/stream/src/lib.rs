@@ -12,10 +12,13 @@ mod migrations;
 mod router;
 
 use bindings::exports::myapp::plugin::plugin_api::Guest;
-use bindings::myapp::plugin::host_api;
+use bindings::{wit_future, wit_stream};
 use bindings::myapp::plugin::types::{
-    EventEnvelope, HttpRequest, HttpResponse, PluginError, PluginManifest,
+    EventEnvelope, HttpRequest, HttpResponse, PluginError, PluginManifest, WsMessage,
 };
+
+/// Items per boundary crossing on the SSE stream.
+const SSE_BATCH: usize = 32;
 
 struct Component;
 
@@ -42,11 +45,33 @@ impl Guest for Component {
         Err(PluginError::NotFound)
     }
 
-    async fn handle_websocket(_path: String, _conn_id: u64) -> Result<(), PluginError> {
-        Ok(())
+    async fn handle_websocket(
+        _path: String,
+        _conn_id: u64,
+        _incoming: wit_bindgen::StreamReader<WsMessage>,
+    ) -> (
+        wit_bindgen::StreamReader<WsMessage>,
+        wit_bindgen::FutureReader<Result<(), PluginError>>,
+    ) {
+        let (tx, rx) = wit_stream::new::<WsMessage>();
+        let (done_tx, done_rx) = wit_future::new::<Result<(), PluginError>>(|| Ok(()));
+        drop(tx);
+        wit_bindgen::spawn_local(async move {
+            done_tx.write(Ok(())).await;
+        });
+        (rx, done_rx)
     }
 
-    async fn handle_sse(path: String, _conn_id: u64) -> Result<(), PluginError> {
+    /// Returns the chunk stream immediately; items are produced in a spawned
+    /// task. `write_all` blocks once the host-side buffer fills, so a slow
+    /// client throttles this loop instead of piling up in the host.
+    async fn handle_sse(
+        path: String,
+        _conn_id: u64,
+    ) -> (
+        wit_bindgen::StreamReader<Vec<u8>>,
+        wit_bindgen::FutureReader<Result<(), PluginError>>,
+    ) {
         // path is e.g. "/generate?count=10"
         let count: u32 = path
             .split_once('?')
@@ -58,11 +83,30 @@ impl Guest for Component {
             .unwrap_or(5)
             .min(100);
 
-        for i in 0..count {
-            let chunk = format!(r#"{{"index":{},"data":"item_{}"}}"#, i, i);
-            host_api::sse_yield(chunk.as_bytes())
-                .map_err(|e| PluginError::Internal(format!("{e:?}")))?;
-        }
-        Ok(())
+        let (mut chunks_tx, chunks_rx) = wit_stream::new::<Vec<u8>>();
+        let (done_tx, done_rx) = wit_future::new::<Result<(), PluginError>>(|| {
+            Err(PluginError::Internal("sse handler dropped".into()))
+        });
+
+        wit_bindgen::spawn_local(async move {
+            // Batch writes: one `write_all` is one boundary crossing regardless
+            // of how many items it carries, so filling the batch amortises the
+            // per-crossing cost across chunks.
+            let mut batch = Vec::with_capacity(SSE_BATCH);
+            for i in 0..count {
+                batch.push(format!(r#"{{"index":{},"data":"item_{}"}}"#, i, i).into_bytes());
+                if batch.len() == SSE_BATCH {
+                    chunks_tx.write_all(core::mem::take(&mut batch)).await;
+                    batch.reserve(SSE_BATCH);
+                }
+            }
+            if !batch.is_empty() {
+                chunks_tx.write_all(batch).await;
+            }
+            drop(chunks_tx);
+            done_tx.write(Ok(())).await;
+        });
+
+        (chunks_rx, done_rx)
     }
 }

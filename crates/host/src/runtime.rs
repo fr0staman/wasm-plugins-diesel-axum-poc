@@ -1,16 +1,21 @@
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store};
+use tokio::sync::{broadcast, mpsc};
+use wasmtime::component::{
+    Access, Accessor, Component, FutureReader, HasSelf, Linker, ResourceTable, StreamReader,
+};
+use wasmtime::{
+    AsContextMut, Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store,
+};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::bindings::myapp::plugin::types::{
     EventEnvelope, EventPayload, EventSource, EventSubscription, HttpRequest, HttpResponse,
-    SystemEvent, SystemEventKind,
+    SystemEvent, SystemEventKind, WsMessage,
 };
 use crate::bindings::{Plugin, PluginPre};
+use crate::streams::{ChannelConsumer, ChannelProducer, OneshotConsumer};
 use crate::context::SharedCache;
 use crate::db::DbPool;
 use crate::dispatcher::Dispatcher;
@@ -88,6 +93,29 @@ pub struct PluginExecutor {
     pub ws_tx: broadcast::Sender<String>,
 }
 
+/// Awaits a plugin's terminal `future<result<_, plugin-error>>`.
+///
+/// Host futures are consumed by piping, not awaiting, so the value is routed
+/// through a oneshot. A dropped sender means the plugin never resolved the
+/// future — treated as a clean close, since the streams are already finished by
+/// the time we get here.
+async fn await_terminal(
+    accessor: &Accessor<PluginState>,
+    done: FutureReader<Result<(), crate::bindings::myapp::plugin::types::PluginError>>,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    accessor
+        .with(|mut store: Access<'_, PluginState>| {
+            done.pipe(store.as_context_mut(), OneshotConsumer::new(tx))
+        })
+        .map_err(|e| e.to_string())?;
+
+    match rx.await {
+        Ok(Ok(())) | Err(_) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e:?}")),
+    }
+}
+
 impl PluginExecutor {
     fn make_store(&self, plugin_name: &str, chain_depth: u8) -> Store<PluginState> {
         let wasi = WasiCtxBuilder::new().inherit_stderr().build();
@@ -100,19 +128,16 @@ impl PluginExecutor {
             plugin_name: plugin_name.to_string(),
             validation_cache: self.validation_cache.clone(),
             current_chain_depth: chain_depth,
-            ws: None,
-            sse: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.set_fuel(10_000_000).ok();
         store
     }
 
-    pub fn make_store_ws(
-        &self,
-        plugin_name: &str,
-        ws: crate::host_api::WsInFlight,
-    ) -> Store<PluginState> {
+    /// Store for a long-lived streaming connection (WS/SSE).
+    /// consume_fuel is enabled engine-wide; u64::MAX = no practical limit, since
+    /// these run for the lifetime of the connection.
+    fn make_store_streaming(&self, plugin_name: &str) -> Store<PluginState> {
         let wasi = WasiCtxBuilder::new().inherit_stderr().build();
         let state = PluginState {
             wasi,
@@ -123,79 +148,78 @@ impl PluginExecutor {
             plugin_name: plugin_name.to_string(),
             validation_cache: self.validation_cache.clone(),
             current_chain_depth: 0,
-            ws: Some(ws),
-            sse: None,
         };
         let mut store = Store::new(&self.engine, state);
-        // consume_fuel is enabled engine-wide; u64::MAX = no practical limit for long-lived WS.
         store.set_fuel(u64::MAX).ok();
         store
     }
 
-    pub fn make_store_sse(
-        &self,
-        plugin_name: &str,
-        sse: crate::host_api::SseInFlight,
-    ) -> Store<PluginState> {
-        let wasi = WasiCtxBuilder::new().inherit_stderr().build();
-        let state = PluginState {
-            wasi,
-            table: ResourceTable::new(),
-            db: self.db.clone(),
-            cache: self.cache.clone(),
-            dispatcher: self.dispatcher.clone(),
-            plugin_name: plugin_name.to_string(),
-            validation_cache: self.validation_cache.clone(),
-            current_chain_depth: 0,
-            ws: None,
-            sse: Some(sse),
-        };
-        let mut store = Store::new(&self.engine, state);
-        // consume_fuel is enabled engine-wide; u64::MAX = no practical limit for long-lived SSE.
-        store.set_fuel(u64::MAX).ok();
-        store
-    }
-
+    /// Runs a WebSocket connection. `inbound` carries client frames into the
+    /// plugin; replies come back on the stream the plugin returns and are
+    /// forwarded to `outbound`, which is bounded so a slow client applies
+    /// backpressure to the plugin instead of growing a host-side buffer.
+    ///
+    /// Returns when the plugin's reply stream closes and its terminal future
+    /// resolves.
     pub async fn call_websocket(
         &self,
         plugin_name: &str,
         pre: &PluginPre<PluginState>,
         path: String,
         conn_id: u64,
-        ws: crate::host_api::WsInFlight,
+        inbound: mpsc::Receiver<WsMessage>,
+        outbound: mpsc::Sender<Vec<WsMessage>>,
     ) -> anyhow::Result<()> {
-        let mut store = self.make_store_ws(plugin_name, ws);
+        let mut store = self.make_store_streaming(plugin_name);
         let instance = pre.instantiate_async(&mut store).await?;
+
         store
-            .run_concurrent(async move |accessor| {
-                instance
+            .run_concurrent(async move |accessor: &Accessor<PluginState>| -> anyhow::Result<()> {
+                let incoming = accessor.with(|mut store: Access<'_, PluginState>| {
+                    StreamReader::new(store.as_context_mut(), ChannelProducer::new(inbound))
+                })?;
+
+                let (replies, done) = instance
                     .myapp_plugin_plugin_api()
-                    .call_handle_websocket(accessor, path, conn_id)
-                    .await
+                    .call_handle_websocket(accessor, path, conn_id, incoming)
+                    .await?;
+
+                accessor.with(|mut store: Access<'_, PluginState>| {
+                    replies.pipe(store.as_context_mut(), ChannelConsumer::new(outbound))
+                })?;
+
+                await_terminal(accessor, done).await.map_err(|e| anyhow::anyhow!("ws plugin error: {e}"))
             })
-            .await??
-            .map_err(|e| anyhow::anyhow!("ws plugin error: {:?}", e))
+            .await?
     }
 
+    /// Runs an SSE stream. Each item the plugin writes becomes one `data:` line.
+    /// `outbound` is bounded for the same backpressure reason as WS.
     pub async fn call_sse(
         &self,
         plugin_name: &str,
         pre: &PluginPre<PluginState>,
         path: String,
         conn_id: u64,
-        sse: crate::host_api::SseInFlight,
+        outbound: mpsc::Sender<Vec<Vec<u8>>>,
     ) -> anyhow::Result<()> {
-        let mut store = self.make_store_sse(plugin_name, sse);
+        let mut store = self.make_store_streaming(plugin_name);
         let instance = pre.instantiate_async(&mut store).await?;
+
         store
-            .run_concurrent(async move |accessor| {
-                instance
+            .run_concurrent(async move |accessor: &Accessor<PluginState>| -> anyhow::Result<()> {
+                let (chunks, done) = instance
                     .myapp_plugin_plugin_api()
                     .call_handle_sse(accessor, path, conn_id)
-                    .await
+                    .await?;
+
+                accessor.with(|mut store: Access<'_, PluginState>| {
+                    chunks.pipe(store.as_context_mut(), ChannelConsumer::new(outbound))
+                })?;
+
+                await_terminal(accessor, done).await.map_err(|e| anyhow::anyhow!("sse plugin error: {e}"))
             })
-            .await??
-            .map_err(|e| anyhow::anyhow!("sse plugin error: {:?}", e))
+            .await?
     }
 
     pub async fn call_http(

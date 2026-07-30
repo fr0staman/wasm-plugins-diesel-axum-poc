@@ -18,6 +18,11 @@ use crate::{
 
 use crate::api::AppState;
 
+/// Depth of the host-side buffer between a plugin's stream and the socket.
+/// Small on purpose: it exists to smooth scheduling jitter, not to absorb a
+/// client that cannot keep up — that case must reach the plugin as backpressure.
+const STREAM_BUFFER: usize = 32;
+
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         //.routes(routes!(plugin_handler))
@@ -378,14 +383,14 @@ async fn sse_plugin_handler(
     let full_path = format!("{sse_path}{query}");
 
     let conn_id = crate::host_api::new_conn_id();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<axum::body::Bytes>();
+    // Bounded: the plugin's stream writes block once the client falls this far
+    // behind, rather than the host buffering without limit. Items arrive in
+    // batches, so capacity is STREAM_BUFFER batches, not chunks.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<Vec<u8>>>(STREAM_BUFFER);
 
     tokio::spawn(async move {
-        let sse_state = crate::host_api::SseInFlight {
-            outbound: outbound_tx,
-        };
         if let Err(e) = executor
-            .call_sse(&plugin_name, &pre, full_path, conn_id, sse_state)
+            .call_sse(&plugin_name, &pre, full_path, conn_id, outbound_tx)
             .await
         {
             tracing::error!(plugin = %plugin_name, error = %e, "sse plugin error");
@@ -393,10 +398,12 @@ async fn sse_plugin_handler(
     });
 
     let stream = async_stream::stream! {
-        while let Some(chunk) = outbound_rx.recv().await {
-            yield Ok::<Event, Infallible>(
-                Event::default().data(String::from_utf8_lossy(&chunk).into_owned())
-            );
+        while let Some(batch) = outbound_rx.recv().await {
+            for chunk in batch {
+                yield Ok::<Event, Infallible>(
+                    Event::default().data(String::from_utf8_lossy(&chunk).into_owned())
+                );
+            }
         }
     };
 
@@ -418,8 +425,10 @@ async fn handle_ws_plugin(
     use tokio::sync::mpsc;
 
     let (mut sink, mut stream) = socket.split();
-    let (inbound_tx, inbound_rx) = mpsc::channel::<WsMessage>(32);
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
+    let (inbound_tx, inbound_rx) = mpsc::channel::<WsMessage>(STREAM_BUFFER);
+    // Bounded for the same reason as SSE: a slow client must not let the plugin
+    // queue frames without limit.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<WsMessage>>(STREAM_BUFFER);
 
     let inbound_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
@@ -436,19 +445,27 @@ async fn handle_ws_plugin(
     });
 
     let outbound_task = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+        'outer: while let Some(batch) = outbound_rx.recv().await {
+            for msg in batch {
+                let axum_msg = match msg {
+                    WsMessage::Text(t) => Message::Text(t.into()),
+                    WsMessage::Binary(b) => Message::Binary(b.into()),
+                    WsMessage::Close(reason) => Message::Close(reason.map(|r| {
+                        axum::extract::ws::CloseFrame {
+                            code: 1000,
+                            reason: r.into(),
+                        }
+                    })),
+                };
+                if sink.send(axum_msg).await.is_err() {
+                    break 'outer;
+                }
             }
         }
     });
 
-    let ws_state = crate::host_api::WsInFlight {
-        inbound: inbound_rx,
-        outbound: outbound_tx,
-    };
     if let Err(e) = executor
-        .call_websocket(&plugin_name, &pre, path, conn_id, ws_state)
+        .call_websocket(&plugin_name, &pre, path, conn_id, inbound_rx, outbound_tx)
         .await
     {
         tracing::error!(plugin = %plugin_name, error = %e, "ws plugin error");

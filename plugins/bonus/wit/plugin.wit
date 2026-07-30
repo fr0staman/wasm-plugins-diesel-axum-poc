@@ -122,7 +122,7 @@ interface types {
 
 interface host-api {
     use types.{rendered-query, plugin-error, event-payload, log-level,
-               user-snapshot, user-tier, payment-snapshot, ws-message};
+               user-snapshot, user-tier, payment-snapshot};
 
     /// Asynchrony is declared here, in the contract — not in bindgen options.
     /// A function is `async func` when the host implementation genuinely awaits
@@ -156,23 +156,14 @@ interface host-api {
     create-payment: async func(user-id: u64, amount-cents: s64, currency: string, method: string)
         -> result<payment-snapshot, plugin-error>;
 
-    /// Receive the next typed WebSocket message.
-    /// Returns none when the client closed the connection.
-    /// Blocks for an unbounded time, so it is async in the contract.
-    ws-recv: async func() -> option<ws-message>;
-
-    /// Send a typed WebSocket message to the connected client.
-    /// Non-blocking: hands the frame to the connection's outbound channel.
-    ws-send: func(msg: ws-message) -> result<_, plugin-error>;
-
-    /// Push one SSE data chunk to the connected client.
-    /// Each call emits a single data: line; the stream closes when handle-sse returns.
-    /// Non-blocking, like ws-send.
-    sse-yield: func(data: list<u8>) -> result<_, plugin-error>;
+    // WebSocket and SSE traffic no longer crosses the boundary one call at a
+    // time: both are component-model streams passed to / returned from the
+    // handlers in plugin-api below.
 }
 
 interface plugin-api {
-    use types.{event-envelope, plugin-error, http-request, http-response, plugin-manifest};
+    use types.{event-envelope, plugin-error, http-request, http-response, plugin-manifest,
+               ws-message};
 
     /// Return all static metadata in one call. HTTP routes are derived by the host from
     /// the openapi field; no separate http-routes list is needed.
@@ -183,13 +174,27 @@ interface plugin-api {
     handle-event: async func(evt: event-envelope) -> result<_, plugin-error>;
     handle-http: async func(req: http-request) -> result<http-response, plugin-error>;
 
-    /// Called once per WebSocket connection. Runs for the lifetime of the connection:
-    /// loop on ws-recv until none, call ws-send to reply. The CM async machinery
-    /// properly suspends the plugin fiber while awaiting each ws-recv.
-    handle-websocket: async func(path: string, conn-id: u64) -> result<_, plugin-error>;
+    /// Called once per WebSocket connection. `incoming` carries client frames;
+    /// the returned stream carries replies.
+    ///
+    /// `async func`, not plain `func`: the handles are returned promptly via
+    /// task.return, but the plugin keeps producing into the reply stream
+    /// afterwards. A sync-lifted export has no callback to be re-entered on, so
+    /// its spawned producer would never run — the stream would hang open and
+    /// deliver nothing. (WASI 0.3 can use plain `func` for the same shape
+    /// because there the *host* produces, not a guest.)
+    ///
+    /// The returned future reports how the connection ended: dropping the reply
+    /// stream closes it, and the future then resolves. Stream carries data,
+    /// future carries the terminal result.
+    handle-websocket: async func(path: string, conn-id: u64, incoming: stream<ws-message>)
+        -> tuple<stream<ws-message>, future<result<_, plugin-error>>>;
 
-    /// Called once per SSE connection. Push chunks by calling sse-yield; returning Ok(()) closes the stream.
-    handle-sse: async func(path: string, conn-id: u64) -> result<_, plugin-error>;
+    /// Called once per SSE connection. Each item on the returned stream becomes
+    /// one `data:` line; dropping the stream closes it. `async func` for the
+    /// same reason as handle-websocket above.
+    handle-sse: async func(path: string, conn-id: u64)
+        -> tuple<stream<list<u8>>, future<result<_, plugin-error>>>;
 }
 
 world plugin {
