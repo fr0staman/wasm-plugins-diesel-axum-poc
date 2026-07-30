@@ -28,6 +28,6 @@ tower              = { version = "0.5.3", default-features = false }
 [profile.release]
 lto = true
 strip = true
-opt-level = "z"
+opt-level = 3
 codegen-units = 1
 panic = "abort"
